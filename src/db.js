@@ -10,8 +10,8 @@ const pool = new pg.Pool({
   // Neon serverless recommends max 1 connection per serverless function but
   // for a traditional Express server 10 is fine.
   max: 10,
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 5_000,
+  idleTimeoutMillis: 60_000,
+  connectionTimeoutMillis: 30_000,
 });
 
 pool.on('error', (err) => {

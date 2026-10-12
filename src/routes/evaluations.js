@@ -64,7 +64,7 @@ async function loadSignatures(evalId, client) {
 // ── GET /evaluations/mine ─────────────────────────────────────────────────
 router.get('/mine', requireAuth, async (req, res, next) => {
   try {
-    const { rows } = await query(
+    let { rows } = await query(
       `SELECT e.*, u.name AS supervisor_name
        FROM evaluations e
        LEFT JOIN users u ON u.id = e.supervisor_id
@@ -72,8 +72,41 @@ router.get('/mine', requireAuth, async (req, res, next) => {
        ORDER BY e.updated_at DESC`,
       [req.user.id]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'No evaluation found for your account.' });
-    res.json(rows[0]);
+
+    if (!rows[0]) {
+      // Auto-heal: if an open cycle exists, create evaluation stub
+      const { rows: cycles } = await query(
+        `SELECT * FROM cycles WHERE status != 'locked' ORDER BY opened_at DESC LIMIT 1`
+      );
+      if (cycles[0]) {
+        const cycle = cycles[0];
+        const evalId = `ev-${cycle.period.trim().replace(/\s+/g, '-').toLowerCase()}-${req.user.id}`;
+        const { rows: uRows } = await query('SELECT supervisor_id FROM users WHERE id = $1', [req.user.id]);
+        const supId = uRows[0]?.supervisor_id || null;
+
+        await query(
+          `INSERT INTO evaluations
+             (id, employee_id, supervisor_id, period, status, attendance, goals, scores,
+              comments, part_h, review_meeting)
+           VALUES ($1,$2,$3,$4,'draft','[]','[]','{}','{}','{}','{}')
+           ON CONFLICT (id) DO NOTHING`,
+          [evalId, req.user.id, supId, cycle.period.trim()]
+        );
+
+        const { rows: created } = await query(
+          `SELECT e.*, u.name AS supervisor_name
+           FROM evaluations e
+           LEFT JOIN users u ON u.id = e.supervisor_id
+           WHERE e.id = $1`,
+          [evalId]
+        );
+        rows = created;
+      }
+    }
+
+    if (!rows[0]) return res.status(404).json({ error: 'No evaluation found for your account. Please ask your admin to open a quarter.' });
+    // Return all evaluations as an array — frontend picks the most recent active one
+    res.json(rows);
   } catch (err) {
     next(err);
   }
@@ -92,6 +125,18 @@ router.get('/', requireAuth, async (req, res, next) => {
          ORDER BY e.updated_at DESC`
       ));
     } else {
+      // Auto-sync: keep open evaluations supervisor_id aligned with current users.supervisor_id
+      await query(
+        `UPDATE evaluations e
+         SET supervisor_id = u.supervisor_id
+         FROM users u
+         WHERE e.employee_id = u.id
+           AND u.supervisor_id = $1
+           AND (e.supervisor_id IS DISTINCT FROM $1)
+           AND e.status != 'locked'`,
+        [req.user.id]
+      );
+
       ({ rows } = await query(
         `SELECT e.*, eu.name AS employee_name, su.name AS supervisor_name
          FROM evaluations e
@@ -122,6 +167,381 @@ router.get('/:id', requireAuth, async (req, res, next) => {
     }
     const sigs = await loadSignatures(ev.id, null);
     res.json({ ...ev, signatures: sigs });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /evaluations/:id/goals ──────────────────────────────────────────
+router.patch('/:id/goals', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { goals } = req.body ?? {};
+    if (!Array.isArray(goals)) {
+      return res.status(400).json({ error: 'goals must be an array.' });
+    }
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.employee_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: you can only edit your own goals.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET goals = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [JSON.stringify(goals), id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/goals/submit ────────────────────────────────────
+router.post('/:id/goals/submit', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.employee_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: you can only submit your own goals.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'goals_submitted', updated_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/goals/approve ───────────────────────────────────
+router.post('/:id/goals/approve', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may approve goals.' });
+    }
+
+    const { rows: cycleRows } = await query(`SELECT status FROM cycles WHERE period = $1`, [ev.period]);
+    const nextStatus = cycleRows[0]?.status === 'self_assessment' ? 'self_assessment' : 'goals_set';
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = $1, goals_rejection_note = NULL, updated_at = now() WHERE id = $2 RETURNING *`,
+      [nextStatus, id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/goals/reject ────────────────────────────────────
+router.post('/:id/goals/reject', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { note } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may reject goals.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'draft', goals_rejection_note = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [note || 'Goals returned for revision', id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /evaluations/:id/self ───────────────────────────────────────────
+router.patch('/:id/self', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { scores, comments } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.employee_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    const setClauses = [];
+    const values = [];
+    let idx = 1;
+    if (scores !== undefined) {
+      setClauses.push(`scores = $${idx++}`);
+      values.push(JSON.stringify(scores));
+    }
+    if (comments !== undefined) {
+      setClauses.push(`comments = $${idx++}`);
+      values.push(JSON.stringify(comments));
+    }
+    setClauses.push(`updated_at = now()`);
+    values.push(id);
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/self/submit ─────────────────────────────────────
+router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.employee_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'supervisor_assessment', updated_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /evaluations/:id/supervisor ─────────────────────────────────────
+router.patch('/:id/supervisor', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { scores, comments } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    const setClauses = [];
+    const values = [];
+    let idx = 1;
+    if (scores !== undefined) {
+      setClauses.push(`scores = $${idx++}`);
+      values.push(JSON.stringify(scores));
+    }
+    if (comments !== undefined) {
+      setClauses.push(`comments = $${idx++}`);
+      values.push(JSON.stringify(comments));
+    }
+    setClauses.push(`supervisor_scored_by = $${idx++}`);
+    values.push(req.user.id);
+    setClauses.push(`updated_at = now()`);
+    values.push(id);
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/supervisor/submit ───────────────────────────────
+router.post('/:id/supervisor/submit', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'review_meeting', updated_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /evaluations/:id/agreed ─────────────────────────────────────────
+router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { scores, goals, partH, reviewMeeting } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    const setClauses = [];
+    const values = [];
+    let idx = 1;
+    if (scores !== undefined) {
+      setClauses.push(`scores = $${idx++}`);
+      values.push(JSON.stringify(scores));
+    }
+    if (goals !== undefined) {
+      setClauses.push(`goals = $${idx++}`);
+      values.push(JSON.stringify(goals));
+    }
+    if (partH !== undefined) {
+      setClauses.push(`part_h = $${idx++}`);
+      values.push(JSON.stringify(partH));
+    }
+    if (reviewMeeting !== undefined) {
+      setClauses.push(`review_meeting = $${idx++}`);
+      values.push(JSON.stringify(reviewMeeting));
+    }
+    setClauses.push(`part_h_by = $${idx++}`);
+    values.push(req.user.id);
+    setClauses.push(`updated_at = now()`);
+    values.push(id);
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET ${setClauses.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/agreed/confirm ──────────────────────────────────
+router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'executive_review', updated_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/executive/approve ───────────────────────────────
+router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (req.user.role !== 'admin' && req.user.role !== 'executive') {
+      return res.status(403).json({ error: 'Forbidden: executive or admin only.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'signoff', updated_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/hr/approve ──────────────────────────────────────
+router.post('/:id/hr/approve', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (req.user.role !== 'admin' && req.user.role !== 'hr_officer') {
+      return res.status(403).json({ error: 'Forbidden: HR or admin only.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'locked', updated_at = now() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /evaluations/:id/attendance ─────────────────────────────────────
+router.patch('/:id/attendance', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { attendance } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET attendance = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [JSON.stringify(attendance || []), id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /evaluations/:id/incidents ──────────────────────────────────────
+router.patch('/:id/incidents', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { incidents } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET incidents = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [JSON.stringify(incidents || []), id]
+    );
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/staff-reply ─────────────────────────────────────
+router.post('/:id/staff-reply', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { comment } = req.body ?? {};
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.employee_id !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden: only the employee may reply.' });
+    }
+
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET staff_comment_on_agreed = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [comment || '', id]
+    );
+    res.json(updated);
   } catch (err) {
     next(err);
   }

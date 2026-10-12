@@ -101,6 +101,25 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res, next) => {
       [id, name.trim(), email.toLowerCase().trim(), hash, password, role, department, position, initials, supervisor_id || null]
     );
 
+    // Auto-create evaluation stubs for any open cycles
+    if (role === 'employee') {
+      try {
+        const { rows: openCycles } = await query("SELECT * FROM cycles WHERE status != 'locked'");
+        for (const cy of openCycles) {
+          const evalId = `ev-${cy.period.trim().replace(/\s+/g, '-').toLowerCase()}-${id}`;
+          await query(
+            `INSERT INTO evaluations
+               (id, employee_id, supervisor_id, period, status, attendance, goals, scores, comments, part_h, review_meeting)
+             VALUES ($1, $2, $3, $4, 'draft', '[]', '[]', '{}', '{}', '{}', '{}')
+             ON CONFLICT (id) DO NOTHING`,
+            [evalId, id, supervisor_id || null, cy.period]
+          );
+        }
+      } catch (e) {
+        console.warn('Failed to auto-create evaluation stubs for new employee:', e);
+      }
+    }
+
     res.status(201).json(rows[0]);
   } catch (err) {
     next(err);
@@ -174,6 +193,7 @@ const UpdateUserSchema = z.object({
   supervisor_id:   z.string().nullable().optional(),
   start_date:      z.string().nullable().optional(),
   role:            z.string().optional(),
+  active:          z.boolean().optional(),
 }).strict();
 
 router.patch('/:id', requireAuth, requireRole('admin'), async (req, res, next) => {
@@ -252,6 +272,13 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res, next) =
       `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${paramIdx} RETURNING *`,
       values
     );
+
+    if (patch.supervisor_id !== undefined) {
+      await client.query(
+        `UPDATE evaluations SET supervisor_id = $1 WHERE employee_id = $2 AND status != 'locked'`,
+        [patch.supervisor_id || null, id]
+      );
+    }
 
     await client.query('COMMIT');
     res.json(safeUser(updated[0]));
