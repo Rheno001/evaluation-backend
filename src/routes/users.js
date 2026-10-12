@@ -229,6 +229,9 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res, next) =
         values.push(hash);
         setClauses.push(`raw_password = $${paramIdx++}`);
         values.push(val);
+      } else if (key === 'supervisor_id') {
+        setClauses.push(`${key} = $${paramIdx++}`);
+        values.push(val && String(val).trim() ? String(val).trim() : null);
       } else {
         setClauses.push(`${key} = $${paramIdx++}`);
         values.push(val);
