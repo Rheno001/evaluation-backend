@@ -1,0 +1,438 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  src/routes/users.js
+//  GET  /users            (admin only)
+//  GET  /users/:id        (self or admin)
+//  PATCH /users/:id       (admin only — updateUser)
+//  POST /users/:id/deactivate   (admin only — setUserActive with departure)
+//  POST /users/:id/activate     (admin only)
+//  POST /users/reassign-all     (admin only — reassignAllFrom, one transaction)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Router } from 'express';
+import { z } from 'zod';
+import { requireAuth, requireRole } from '../auth.js';
+import { query, getClient } from '../db.js';
+import {
+  canDeactivate,
+  canChangeRole,
+  canReassign,
+  supervisorPendingWork,
+  directReports,
+  setupWarnings,
+} from '../lib/rules.js';
+
+const router = Router();
+
+// ── helper: row → safe user object (strips password_hash / token_version) ────
+function safeUser(row) {
+  if (!row) return null;
+  const { password_hash: _, token_version: __, ...rest } = row;
+  return rest;
+}
+
+// ── helper: load full user list from DB (used by rules) ─────────────────────
+async function loadUsers(client) {
+  const { rows } = await (client ?? query)('SELECT * FROM users', []);
+  return rows;
+}
+
+async function loadEvaluations(client) {
+  const { rows } = await (client ?? query)('SELECT * FROM evaluations', []);
+  return rows;
+}
+
+// ── helper: increment token_version for a user (invalidates sessions) ────────
+async function bumpTokenVersion(client, userId) {
+  await client.query(
+    'UPDATE users SET token_version = token_version + 1 WHERE id = $1',
+    [userId]
+  );
+}
+
+// ── GET /users ─────────────────────────────────────────────────────────────
+router.get('/', requireAuth, requireRole('admin'), async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, name, email, role, department, position,
+              avatar_initials, supervisor_id, active, start_date, created_at
+       FROM users ORDER BY name`
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /users/:id ─────────────────────────────────────────────────────────
+router.get('/:id', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (req.user.role !== 'admin' && req.user.id !== id) {
+      return res.status(403).json({ error: 'Forbidden: you may only view your own profile.' });
+    }
+    const { rows } = await query(
+      `SELECT id, name, email, role, department, position,
+              avatar_initials, supervisor_id, active, start_date, created_at
+       FROM users WHERE id = $1`,
+      [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: `User ${id} not found.` });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PATCH /users/:id  (updateUser) ─────────────────────────────────────────
+const UpdateUserSchema = z.object({
+  name:            z.string().min(1).optional(),
+  email:           z.string().email().optional(),
+  department:      z.string().optional(),
+  position:        z.string().optional(),
+  avatar_initials: z.string().max(3).optional(),
+  supervisor_id:   z.string().nullable().optional(),
+  start_date:      z.string().nullable().optional(),
+  role:            z.string().optional(),
+}).strict();
+
+router.patch('/:id', requireAuth, requireRole('admin'), async (req, res, next) => {
+  const client = await getClient();
+  try {
+    const { id } = req.params;
+    const parse = UpdateUserSchema.safeParse(req.body ?? {});
+    if (!parse.success) {
+      return res.status(400).json({ error: parse.error.issues[0].message });
+    }
+    const patch = parse.data;
+
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      'SELECT * FROM users WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+    const target = rows[0];
+    if (!target) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `User ${id} not found.` });
+    }
+
+    // If role is changing, validate with rules
+    if (patch.role && patch.role !== target.role) {
+      const users = await loadUsers(client);
+      const evals = await loadEvaluations(client);
+      const check = canChangeRole({
+        actor: req.user,
+        target,
+        newRole: patch.role,
+        users,
+        evaluations: evals,
+      });
+      if (!check.allowed) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ error: check.reason });
+      }
+    }
+
+    // Determine if token_version must be bumped
+    const sensitiveChange = patch.role || patch.supervisor_id !== undefined || patch.active !== undefined;
+
+    const setClauses = [];
+    const values = [];
+    let paramIdx = 1;
+
+    for (const [key, val] of Object.entries(patch)) {
+      setClauses.push(`${key} = $${paramIdx++}`);
+      values.push(val);
+    }
+
+    if (sensitiveChange) {
+      setClauses.push(`token_version = token_version + 1`);
+    }
+
+    if (setClauses.length === 0) {
+      await client.query('ROLLBACK');
+      return res.json(safeUser(target));
+    }
+
+    values.push(id); // last param = WHERE id
+    const { rows: updated } = await client.query(
+      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${paramIdx} RETURNING *`,
+      values
+    );
+
+    await client.query('COMMIT');
+    res.json(safeUser(updated[0]));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// ── POST /users/:id/deactivate  (setUserActive with departure) ─────────────
+const DeactivateSchema = z.object({
+  departure: z.object({
+    lastWorkingDay: z.string(),
+    note:           z.string().min(1),
+  }).optional(),
+});
+
+router.post('/:id/deactivate', requireAuth, requireRole('admin'), async (req, res, next) => {
+  const client = await getClient();
+  try {
+    const { id } = req.params;
+    const parse = DeactivateSchema.safeParse(req.body ?? {});
+    if (!parse.success) {
+      return res.status(400).json({ error: parse.error.issues[0].message });
+    }
+    const { departure } = parse.data;
+
+    await client.query('BEGIN');
+
+    // Lock the target user row (NOWAIT → 409 if another request has the lock)
+    let targetRows;
+    try {
+      targetRows = await client.query(
+        'SELECT * FROM users WHERE id = $1 FOR UPDATE NOWAIT',
+        [id]
+      );
+    } catch (lockErr) {
+      await client.query('ROLLBACK');
+      if (lockErr.code === '55P03') {
+        return res.status(409).json({
+          error: 'Another request is already processing this user. Please retry.',
+        });
+      }
+      throw lockErr;
+    }
+
+    const target = targetRows.rows[0];
+    if (!target) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `User ${id} not found.` });
+    }
+
+    if (!target.active) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: `User ${id} not found.` });
+    }
+
+    // Lock all evaluations where this user is supervisor and still open
+    await client.query(
+      `SELECT id FROM evaluations
+       WHERE supervisor_id = $1
+         AND status NOT IN ('hr_review','locked','completed')
+       FOR UPDATE NOWAIT`,
+      [id]
+    );
+
+    // Load all data for rules module
+    const { rows: allUsers }  = await client.query('SELECT * FROM users');
+    const { rows: allEvals }  = await client.query('SELECT * FROM evaluations');
+
+    const check = canDeactivate({ target, users: allUsers, evaluations: allEvals });
+    if (!check.allowed) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: 'Cannot deactivate user.', blockers: check.blockers });
+    }
+
+    // Deactivate + bump token_version
+    await client.query(
+      `UPDATE users SET active = false, token_version = token_version + 1 WHERE id = $1`,
+      [id]
+    );
+
+    // If departure provided, close open employee evaluations
+    if (departure) {
+      const openEvals = allEvals.filter(
+        (ev) => ev.employee_id === id && !['locked', 'completed'].includes(ev.status)
+      );
+      const depRecord = {
+        ...departure,
+        recordedBy: req.user.id,
+        recordedAt: new Date().toISOString(),
+      };
+
+      for (const ev of openEvals) {
+        const auditEntry = {
+          id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: new Date().toISOString(),
+          actorId: req.user.id,
+          actorName: req.user.name,
+          actorRole: req.user.role,
+          action: 'EMPLOYEE_DEPARTURE',
+          details: { departureDate: departure.lastWorkingDay },
+        };
+        const existingLog = ev.audit_log ?? [];
+        await client.query(
+          `UPDATE evaluations
+           SET status = 'completed',
+               departure = $1,
+               audit_log = $2,
+               updated_at = now()
+           WHERE id = $3`,
+          [JSON.stringify(depRecord), JSON.stringify([...existingLog, auditEntry]), ev.id]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+
+    const { rows: final } = await query(
+      `SELECT id, name, email, role, department, position,
+              avatar_initials, supervisor_id, active, start_date
+       FROM users WHERE id = $1`,
+      [id]
+    );
+    res.json(final[0]);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// ── POST /users/:id/activate ────────────────────────────────────────────────
+router.post('/:id/activate', requireAuth, requireRole('admin'), async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await query(
+      `UPDATE users SET active = true WHERE id = $1
+       RETURNING id, name, email, role, department, position,
+                 avatar_initials, supervisor_id, active, start_date`,
+      [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: `User ${id} not found.` });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /users/reassign-all  (reassignAllFrom) ─────────────────────────────
+const ReassignAllSchema = z.object({
+  userId:          z.string().min(1),
+  newSupervisorId: z.string().min(1),
+  reason:          z.string().min(1),
+});
+
+router.post('/reassign-all', requireAuth, requireRole('admin'), async (req, res, next) => {
+  const client = await getClient();
+  try {
+    const parse = ReassignAllSchema.safeParse(req.body ?? {});
+    if (!parse.success) {
+      return res.status(400).json({ error: parse.error.issues[0].message });
+    }
+    const { userId, newSupervisorId, reason } = parse.data;
+
+    await client.query('BEGIN');
+
+    // Lock old supervisor + new supervisor rows
+    try {
+      await client.query(
+        'SELECT id FROM users WHERE id = ANY($1) FOR UPDATE NOWAIT',
+        [[userId, newSupervisorId]]
+      );
+    } catch (lockErr) {
+      await client.query('ROLLBACK');
+      if (lockErr.code === '55P03') {
+        return res.status(409).json({
+          error: 'Another request is already processing this user. Please retry.',
+        });
+      }
+      throw lockErr;
+    }
+
+    // Lock all pending evaluations supervised by userId
+    const { rows: pendingEvals } = await client.query(
+      `SELECT * FROM evaluations
+       WHERE supervisor_id = $1
+         AND status NOT IN ('hr_review','locked','completed')
+       FOR UPDATE NOWAIT`,
+      [userId]
+    );
+
+    // Lock direct reports
+    const { rows: reports } = await client.query(
+      `SELECT * FROM users WHERE supervisor_id = $1 FOR UPDATE NOWAIT`,
+      [userId]
+    );
+
+    // Validate new supervisor
+    const { rows: newSupRows } = await client.query(
+      'SELECT * FROM users WHERE id = $1',
+      [newSupervisorId]
+    );
+    const newSupervisor = newSupRows[0];
+    if (!newSupervisor) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `User ${newSupervisorId} not found.` });
+    }
+    if (!['supervisor', 'admin'].includes(newSupervisor.role)) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({
+        error: 'Target user does not have a reviewer role (supervisor or admin).',
+      });
+    }
+    if (!newSupervisor.active) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: 'Target supervisor is inactive.' });
+    }
+
+    // Move evaluations
+    for (const ev of pendingEvals) {
+      const check = canReassign(ev, newSupervisor);
+      if (!check.allowed) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ error: check.reason });
+      }
+      const auditEntry = {
+        id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: new Date().toISOString(),
+        actorId: req.user.id,
+        actorName: req.user.name,
+        actorRole: req.user.role,
+        action: 'SUPERVISOR_REASSIGNED_BULK',
+        details: { oldSupervisorId: userId, newSupervisorId, reason },
+      };
+      const existingLog = ev.audit_log ?? [];
+      await client.query(
+        `UPDATE evaluations
+         SET supervisor_id = $1, audit_log = $2, updated_at = now()
+         WHERE id = $3`,
+        [newSupervisorId, JSON.stringify([...existingLog, auditEntry]), ev.id]
+      );
+    }
+
+    // Move direct reports
+    for (const report of reports) {
+      await client.query(
+        'UPDATE users SET supervisor_id = $1 WHERE id = $2',
+        [newSupervisorId, report.id]
+      );
+    }
+
+    // Bump old supervisor token_version
+    await client.query(
+      'UPDATE users SET token_version = token_version + 1 WHERE id = $1',
+      [userId]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      updatedEvaluations: pendingEvals.length,
+      updatedUsers: reports.length,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+export default router;
