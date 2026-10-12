@@ -4,13 +4,18 @@
 //  schema_migrations table. Safe to run multiple times (idempotent).
 // ─────────────────────────────────────────────────────────────────────────────
 
+import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const connectionString =
+  process.env.DATABASE_URL_UNPOOLED ||
+  process.env.DIRECT_URL ||
+  process.env.DATABASE_URL;
+const pool = new pg.Pool({ connectionString });
 
 async function migrate() {
   const client = await pool.connect();

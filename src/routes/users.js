@@ -49,15 +49,59 @@ async function bumpTokenVersion(client, userId) {
   );
 }
 
+import bcrypt from 'bcryptjs';
+
 // ── GET /users ─────────────────────────────────────────────────────────────
 router.get('/', requireAuth, requireRole('admin'), async (req, res, next) => {
   try {
     const { rows } = await query(
       `SELECT id, name, email, role, department, position,
-              avatar_initials, supervisor_id, active, start_date, created_at
+              avatar_initials, supervisor_id, active, start_date, created_at,
+              raw_password
        FROM users ORDER BY name`
     );
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /users  (admin creates staff account) ──────────────────────────────
+const CreateUserSchema = z.object({
+  name:          z.string().min(1),
+  email:         z.string().email(),
+  password:      z.string().min(1),
+  role:          z.string().min(1),
+  department:    z.string().optional().default(''),
+  position:      z.string().optional().default(''),
+  supervisor_id: z.string().nullable().optional(),
+});
+
+router.post('/', requireAuth, requireRole('admin'), async (req, res, next) => {
+  try {
+    const parse = CreateUserSchema.safeParse(req.body ?? {});
+    if (!parse.success) {
+      return res.status(400).json({ error: parse.error.issues[0].message });
+    }
+    const { name, email, password, role, department, position, supervisor_id } = parse.data;
+
+    const existing = await query('SELECT id FROM users WHERE lower(email) = lower($1)', [email.trim()]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: `A user with email "${email}" already exists.` });
+    }
+
+    const initials = name.trim().split(/\s+/).map(w => w[0].toUpperCase()).slice(0, 2).join('');
+    const id = `u-${Date.now()}`;
+    const hash = await bcrypt.hash(password, 10);
+
+    const { rows } = await query(
+      `INSERT INTO users (id, name, email, password_hash, raw_password, role, department, position, avatar_initials, supervisor_id, active, start_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, CURRENT_DATE)
+       RETURNING id, name, email, role, department, position, avatar_initials, supervisor_id, active, start_date, created_at, raw_password`,
+      [id, name.trim(), email.toLowerCase().trim(), hash, password, role, department, position, initials, supervisor_id || null]
+    );
+
+    res.status(201).json(rows[0]);
   } catch (err) {
     next(err);
   }
@@ -72,7 +116,8 @@ router.get('/:id', requireAuth, async (req, res, next) => {
     }
     const { rows } = await query(
       `SELECT id, name, email, role, department, position,
-              avatar_initials, supervisor_id, active, start_date, created_at
+              avatar_initials, supervisor_id, active, start_date, created_at,
+              raw_password
        FROM users WHERE id = $1`,
       [id]
     );
@@ -83,10 +128,46 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   }
 });
 
+// ── DELETE /users/:id  (admin permanently deletes user) ─────────────────────
+router.delete('/:id', requireAuth, requireRole('admin'), async (req, res, next) => {
+  const client = await getClient();
+  try {
+    const { id } = req.params;
+    if (req.user.id === id) {
+      return res.status(400).json({ error: 'You cannot delete your own admin account.' });
+    }
+
+    await client.query('BEGIN');
+
+    // 1. Reassign supervisees to null
+    await client.query('UPDATE users SET supervisor_id = NULL WHERE supervisor_id = $1', [id]);
+
+    // 2. Delete evaluations and signatures
+    await client.query('DELETE FROM signatures WHERE evaluation_id IN (SELECT id FROM evaluations WHERE employee_id = $1)', [id]);
+    await client.query('DELETE FROM evaluations WHERE employee_id = $1', [id]);
+
+    // 3. Delete user row
+    const delRes = await client.query('DELETE FROM users WHERE id = $1 RETURNING id', [id]);
+    if (delRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `User ${id} not found.` });
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, deletedId: id });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 // ── PATCH /users/:id  (updateUser) ─────────────────────────────────────────
 const UpdateUserSchema = z.object({
   name:            z.string().min(1).optional(),
   email:           z.string().email().optional(),
+  password:        z.string().min(1).optional(),
   department:      z.string().optional(),
   position:        z.string().optional(),
   avatar_initials: z.string().max(3).optional(),
@@ -135,15 +216,23 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res, next) =
     }
 
     // Determine if token_version must be bumped
-    const sensitiveChange = patch.role || patch.supervisor_id !== undefined || patch.active !== undefined;
+    const sensitiveChange = patch.role || patch.supervisor_id !== undefined || patch.active !== undefined || patch.password !== undefined;
 
     const setClauses = [];
     const values = [];
     let paramIdx = 1;
 
     for (const [key, val] of Object.entries(patch)) {
-      setClauses.push(`${key} = $${paramIdx++}`);
-      values.push(val);
+      if (key === 'password') {
+        const hash = await bcrypt.hash(val, 10);
+        setClauses.push(`password_hash = $${paramIdx++}`);
+        values.push(hash);
+        setClauses.push(`raw_password = $${paramIdx++}`);
+        values.push(val);
+      } else {
+        setClauses.push(`${key} = $${paramIdx++}`);
+        values.push(val);
+      }
     }
 
     if (sensitiveChange) {
