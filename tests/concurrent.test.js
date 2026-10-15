@@ -125,6 +125,38 @@ describe('0.5. self-assessment values persist across agreement updates', () => {
   });
 });
 
+describe('0.6. submitted self-assessment remains visible to the employee', () => {
+  beforeEach(async () => { await resetDb(); });
+
+  it('keeps the evaluation in the self-assessment phase after the employee submits it', async () => {
+    const sup = await seedUser({ id: 't06-sup', role: 'supervisor', name: 'Supervisor' });
+    const emp = await seedUser({ id: 't06-emp', role: 'employee', name: 'Employee', supervisor_id: sup.id });
+    const ev = await seedEvaluation({
+      id: 't06-ev-1',
+      employee_id: emp.id,
+      supervisor_id: sup.id,
+      status: 'self_assessment',
+      comments: { B: { staff: 'My review is ready', supervisor: '' } },
+      scores: { B: { attendance: { staff: 4, supervisor: null, agreed: null, evidence: 'Ready to submit' } } },
+    });
+
+    const res = await request(app)
+      .post(`/evaluations/${ev.id}/self/submit`)
+      .set(auth(tokenFor(emp)));
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('self_assessment');
+
+    const listRes = await request(app)
+      .get('/evaluations')
+      .set(auth(tokenFor(emp)));
+
+    expect(listRes.status).toBe(200);
+    expect(listRes.body.some(row => row.id === ev.id && row.status === 'self_assessment')).toBe(true);
+    expect(listRes.body.some(row => row.id === ev.id && row.comments?.B?.staff === 'My review is ready')).toBe(true);
+  });
+});
+
 describe('1. concurrent deactivation of last super_admin', () => {
   beforeEach(async () => { await resetDb(); });
 

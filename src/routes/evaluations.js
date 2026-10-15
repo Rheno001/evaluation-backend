@@ -332,7 +332,7 @@ router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
     }
 
     const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'supervisor_assessment', updated_at = now() WHERE id = $1 RETURNING *`,
+      `UPDATE evaluations SET status = 'self_assessment', updated_at = now() WHERE id = $1 RETURNING *`,
       [id]
     );
     res.json(updated);
