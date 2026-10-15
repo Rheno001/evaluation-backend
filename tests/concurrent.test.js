@@ -63,6 +63,68 @@ describe('0. employee can view their own evaluations in the main list', () => {
   });
 });
 
+describe('0.5. self-assessment values persist across agreement updates', () => {
+  beforeEach(async () => { await resetDb(); });
+
+  it('keeps employee selections while storing the agreed score for display', async () => {
+    const sup = await seedUser({ id: 't05-sup', role: 'supervisor', name: 'Supervisor' });
+    const emp = await seedUser({ id: 't05-emp', role: 'employee', name: 'Employee', supervisor_id: sup.id });
+    const ev = await seedEvaluation({
+      id: 't05-ev-1',
+      employee_id: emp.id,
+      supervisor_id: sup.id,
+      status: 'self_assessment',
+      scores: {
+        B: {
+          meetingAttendanceRate: { staff: 3, supervisor: null, agreed: null, evidence: 'Worked from office 3 days' },
+          punctuality: { staff: 4, supervisor: null, agreed: null, evidence: '' },
+          participation: { staff: 2, supervisor: null, agreed: null, evidence: 'Partial' },
+          advanceNotice: { staff: 5, supervisor: null, agreed: null, evidence: '' },
+        },
+      },
+      comments: {
+        B: { staff: 'I met my target', supervisor: '' },
+      },
+    });
+
+    const empToken = tokenFor(emp);
+    const supToken = tokenFor(sup);
+
+    const selfRes = await request(app)
+      .patch(`/evaluations/${ev.id}/self`)
+      .set(auth(empToken))
+      .send({
+        scores: {
+          B: {
+            meetingAttendanceRate: { staff: 4, supervisor: null, agreed: null, evidence: 'I was here most days' },
+          },
+        },
+        comments: {
+          B: { staff: 'Updated self-reflection', supervisor: '' },
+        },
+      });
+
+    expect(selfRes.status).toBe(200);
+
+    const agreedRes = await request(app)
+      .patch(`/evaluations/${ev.id}/agreed`)
+      .set(auth(supToken))
+      .send({
+        scores: {
+          B: {
+            meetingAttendanceRate: { supervisor: 4, agreed: 4, evidence: 'Agreed by both' },
+          },
+        },
+      });
+
+    expect(agreedRes.status).toBe(200);
+    expect(agreedRes.body.scores.B.meetingAttendanceRate.staff).toBe(4);
+    expect(agreedRes.body.scores.B.meetingAttendanceRate.supervisor).toBe(4);
+    expect(agreedRes.body.scores.B.meetingAttendanceRate.agreed).toBe(4);
+    expect(agreedRes.body.comments.B.staff).toBe('Updated self-reflection');
+  });
+});
+
 describe('1. concurrent deactivation of last super_admin', () => {
   beforeEach(async () => { await resetDb(); });
 

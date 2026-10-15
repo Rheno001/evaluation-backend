@@ -32,6 +32,25 @@ function appendAudit(existingLog, actor, action, details = {}) {
   return [...(existingLog ?? []), entry];
 }
 
+function mergeJsonValues(existingValue, incomingValue) {
+  if (incomingValue === undefined) return existingValue;
+  if (incomingValue === null || typeof incomingValue !== 'object') return incomingValue;
+  if (Array.isArray(incomingValue)) return incomingValue;
+  if (!existingValue || typeof existingValue !== 'object' || Array.isArray(existingValue)) {
+    return incomingValue;
+  }
+
+  const merged = { ...existingValue };
+  for (const [key, value] of Object.entries(incomingValue)) {
+    if (value && typeof value === 'object' && !Array.isArray(value) && merged[key] && typeof merged[key] === 'object' && !Array.isArray(merged[key])) {
+      merged[key] = mergeJsonValues(merged[key], value);
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
 async function getEvalOrFail(res, id, client) {
   const q = client ?? query;
   const { rows } = await (client
@@ -282,11 +301,11 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
     let idx = 1;
     if (scores !== undefined) {
       setClauses.push(`scores = $${idx++}`);
-      values.push(JSON.stringify(scores));
+      values.push(JSON.stringify(mergeJsonValues(ev.scores ?? {}, scores)));
     }
     if (comments !== undefined) {
       setClauses.push(`comments = $${idx++}`);
-      values.push(JSON.stringify(comments));
+      values.push(JSON.stringify(mergeJsonValues(ev.comments ?? {}, comments)));
     }
     setClauses.push(`updated_at = now()`);
     values.push(id);
@@ -339,11 +358,11 @@ router.patch('/:id/supervisor', requireAuth, async (req, res, next) => {
     let idx = 1;
     if (scores !== undefined) {
       setClauses.push(`scores = $${idx++}`);
-      values.push(JSON.stringify(scores));
+      values.push(JSON.stringify(mergeJsonValues(ev.scores ?? {}, scores)));
     }
     if (comments !== undefined) {
       setClauses.push(`comments = $${idx++}`);
-      values.push(JSON.stringify(comments));
+      values.push(JSON.stringify(mergeJsonValues(ev.comments ?? {}, comments)));
     }
     setClauses.push(`supervisor_scored_by = $${idx++}`);
     values.push(req.user.id);
@@ -398,19 +417,19 @@ router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
     let idx = 1;
     if (scores !== undefined) {
       setClauses.push(`scores = $${idx++}`);
-      values.push(JSON.stringify(scores));
+      values.push(JSON.stringify(mergeJsonValues(ev.scores ?? {}, scores)));
     }
     if (goals !== undefined) {
       setClauses.push(`goals = $${idx++}`);
-      values.push(JSON.stringify(goals));
+      values.push(JSON.stringify(Array.isArray(goals) ? goals : mergeJsonValues(ev.goals ?? [], goals)));
     }
     if (partH !== undefined) {
       setClauses.push(`part_h = $${idx++}`);
-      values.push(JSON.stringify(partH));
+      values.push(JSON.stringify(mergeJsonValues(ev.part_h ?? {}, partH)));
     }
     if (reviewMeeting !== undefined) {
       setClauses.push(`review_meeting = $${idx++}`);
-      values.push(JSON.stringify(reviewMeeting));
+      values.push(JSON.stringify(mergeJsonValues(ev.review_meeting ?? {}, reviewMeeting)));
     }
     setClauses.push(`part_h_by = $${idx++}`);
     values.push(req.user.id);
