@@ -5,6 +5,7 @@
 
 import 'dotenv/config';
 import express from 'express';
+import { ensureDefaultAdmin } from './db.js';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import cycleRoutes from './routes/cycles.js';
@@ -53,8 +54,14 @@ app.use((err, req, res, _next) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`evaluation-api listening on port ${PORT}`);
-});
+
+async function start() {
+  await ensureDefaultAdmin();
+  app.listen(PORT, () => {
+    console.log(`evaluation-api listening on port ${PORT}`);
+  });
+}
+
+start();
 
 export default app; // for test imports

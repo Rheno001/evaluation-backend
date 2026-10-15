@@ -347,8 +347,10 @@ router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
       waived: !!ev.waived_self_assessment_note,
       waivedNote: ev.waived_self_assessment_note ?? null,
       goals: ev.goals,
+      attendance: ev.attendance,
       scores: ev.scores,
       comments: ev.comments,
+      part_h: ev.part_h,
     });
   } catch (err) {
     next(err);
@@ -451,7 +453,7 @@ router.post('/:id/goals/reject', requireAuth, async (req, res, next) => {
 router.patch('/:id/self', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { scores, comments } = req.body ?? {};
+    const { scores, comments, attendance, part_h } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
@@ -474,6 +476,14 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
       setClauses.push(`comments = $${idx++}`);
       values.push(JSON.stringify(mergeJsonValues(ev.comments ?? {}, comments)));
     }
+    if (attendance !== undefined) {
+      setClauses.push(`attendance = $${idx++}`);
+      values.push(JSON.stringify(Array.isArray(attendance) ? attendance : ev.attendance ?? []));
+    }
+    if (part_h !== undefined) {
+      setClauses.push(`part_h = $${idx++}`);
+      values.push(JSON.stringify(mergeJsonValues(ev.part_h ?? {}, part_h)));
+    }
     setClauses.push(`updated_at = now()`);
     values.push(id);
 
@@ -491,7 +501,7 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
 router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { scores, comments } = req.body ?? {};
+    const { scores, comments, attendance, part_h } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
@@ -518,8 +528,16 @@ router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
 
     const finalScores = mergeJsonValues(ev.scores ?? {}, scores ?? {});
     const finalComments = mergeJsonValues(ev.comments ?? {}, comments ?? {});
-    if (!finalScores || Object.keys(finalScores).length === 0) {
-      return res.status(400).json({ error: 'Fill in your self-assessment scores before submitting.' });
+    const finalAttendance = Array.isArray(attendance) ? attendance : ev.attendance ?? [];
+    const finalPartH = mergeJsonValues(ev.part_h ?? {}, part_h ?? {});
+    const hasBodyData = !!(
+      (finalScores && Object.keys(finalScores).length > 0) ||
+      (finalComments && Object.keys(finalComments).length > 0) ||
+      (Array.isArray(finalAttendance) && finalAttendance.length > 0) ||
+      (finalPartH && Object.keys(finalPartH).length > 0)
+    );
+    if (!hasBodyData) {
+      return res.status(400).json({ error: 'Fill in your self-assessment before submitting.' });
     }
 
     const newLog = appendAudit(ev.audit_log, req.user, 'SELF_ASSESSMENT_SUBMITTED', {
@@ -530,15 +548,19 @@ router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
       `UPDATE evaluations
        SET status = 'supervisor_assessment',
            supervisor_id = $1,
-           scores = $2,
-           comments = $3,
-           audit_log = $4,
+           attendance = $2,
+           scores = $3,
+           comments = $4,
+           part_h = $5,
+           audit_log = $6,
            updated_at = now()
-       WHERE id = $5 RETURNING *`,
+       WHERE id = $7 RETURNING *`,
       [
         supervisorId,
+        JSON.stringify(finalAttendance),
         JSON.stringify(finalScores),
         JSON.stringify(finalComments),
+        JSON.stringify(finalPartH),
         JSON.stringify(newLog),
         id,
       ]
