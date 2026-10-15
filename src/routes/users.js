@@ -32,12 +32,14 @@ function safeUser(row) {
 
 // ── helper: load full user list from DB (used by rules) ─────────────────────
 async function loadUsers(client) {
-  const { rows } = await (client ?? query)('SELECT * FROM users', []);
+  const fn = client ? client.query.bind(client) : query;
+  const { rows } = await fn('SELECT * FROM users', []);
   return rows;
 }
 
 async function loadEvaluations(client) {
-  const { rows } = await (client ?? query)('SELECT * FROM evaluations', []);
+  const fn = client ? client.query.bind(client) : query;
+  const { rows } = await fn('SELECT * FROM evaluations', []);
   return rows;
 }
 

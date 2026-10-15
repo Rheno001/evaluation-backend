@@ -65,8 +65,9 @@ async function loadSignatures(evalId, client) {
 router.get('/mine', requireAuth, async (req, res, next) => {
   try {
     let { rows } = await query(
-      `SELECT e.*, u.name AS supervisor_name
+      `SELECT e.*, eu.name AS employee_name, u.name AS supervisor_name
        FROM evaluations e
+       LEFT JOIN users eu ON eu.id = e.employee_id
        LEFT JOIN users u ON u.id = e.supervisor_id
        WHERE e.employee_id = $1
        ORDER BY e.updated_at DESC`,
@@ -94,8 +95,9 @@ router.get('/mine', requireAuth, async (req, res, next) => {
         );
 
         const { rows: created } = await query(
-          `SELECT e.*, u.name AS supervisor_name
+          `SELECT e.*, eu.name AS employee_name, u.name AS supervisor_name
            FROM evaluations e
+           LEFT JOIN users eu ON eu.id = e.employee_id
            LEFT JOIN users u ON u.id = e.supervisor_id
            WHERE e.id = $1`,
           [evalId]
@@ -104,9 +106,8 @@ router.get('/mine', requireAuth, async (req, res, next) => {
       }
     }
 
-    if (!rows[0]) return res.status(404).json({ error: 'No evaluation found for your account. Please ask your admin to open a quarter.' });
-    // Return all evaluations as an array — frontend picks the most recent active one
-    res.json(rows);
+    // Frontends commonly treat this as a list endpoint; an empty list is a valid state.
+    res.json(rows ?? []);
   } catch (err) {
     next(err);
   }
@@ -142,7 +143,7 @@ router.get('/', requireAuth, async (req, res, next) => {
          FROM evaluations e
          LEFT JOIN users eu ON eu.id = e.employee_id
          LEFT JOIN users su ON su.id = e.supervisor_id
-         WHERE e.supervisor_id = $1
+         WHERE e.supervisor_id = $1 OR e.employee_id = $1
          ORDER BY e.updated_at DESC`,
         [req.user.id]
       ));

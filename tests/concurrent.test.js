@@ -39,6 +39,30 @@ afterAll(async () => {
 //  admin account. One must fail; the DB must never be left with 0 active admins.
 // ─────────────────────────────────────────────────────────────────────────────
 
+describe('0. employee can view their own evaluations in the main list', () => {
+  beforeEach(async () => { await resetDb(); });
+
+  it('returns the employee-owned evaluation in GET /evaluations', async () => {
+    const sup = await seedUser({ id: 't0-sup', role: 'supervisor', name: 'Supervisor' });
+    const emp = await seedUser({ id: 't0-emp', role: 'employee', name: 'Employee', supervisor_id: sup.id });
+    const ev = await seedEvaluation({
+      id: 't0-ev-1',
+      employee_id: emp.id,
+      supervisor_id: sup.id,
+      status: 'self_assessment',
+    });
+
+    const token = tokenFor(emp);
+    const res = await request(app)
+      .get('/evaluations')
+      .set(auth(token));
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body.some(row => row.id === ev.id)).toBe(true);
+  });
+});
+
 describe('1. concurrent deactivation of last super_admin', () => {
   beforeEach(async () => { await resetDb(); });
 
