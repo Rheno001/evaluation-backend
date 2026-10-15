@@ -9,9 +9,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "migrate": "node migrations/migrate.js",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "migrate": "node migrations/migrate.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -21,13 +19,5 @@
     "pdfkit": "^0.20.2",
     "pg": "^8.13.3",
     "zod": "^3.24.2"
-  },
-  "devDependencies": {
-    "@types/bcryptjs": "^2.4.6",
-    "@types/jsonwebtoken": "^9.0.9",
-    "@types/pg": "^8.11.13",
-    "@types/supertest": "^6.0.3",
-    "supertest": "^7.1.0",
-    "vitest": "^5.0.3"
   }
 }

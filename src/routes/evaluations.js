@@ -620,6 +620,10 @@ router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden.' });
     }
 
+    if (['executive_review', 'signoff', 'hr_review', 'locked'].includes(ev.status)) {
+      return res.status(422).json({ error: 'Agreed scores can no longer be edited at this stage.' });
+    }
+
     const existing = await loadSignatures(id, null);
     let auditLog = ev.audit_log;
     if (existing.employee || existing.supervisor) {
