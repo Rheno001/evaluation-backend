@@ -56,6 +56,15 @@ function mergeJsonValues(existingValue, incomingValue) {
   return merged;
 }
 
+function hasValue(v) {
+  if (v == null) return false;
+  if (typeof v === 'object') {
+    if (Array.isArray(v)) return v.some(hasValue);
+    return Object.values(v).some(hasValue);
+  }
+  return String(v).trim() !== '';
+}
+
 function validSignatureImage(img) {
   return typeof img === 'string' && img.length <= MAX_SIG_CHARS && SIG_DATA_URL.test(img);
 }
@@ -453,7 +462,7 @@ router.post('/:id/goals/reject', requireAuth, async (req, res, next) => {
 router.patch('/:id/self', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { scores, comments, attendance, part_h } = req.body ?? {};
+    const { scores, comments, goals } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
@@ -476,13 +485,13 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
       setClauses.push(`comments = $${idx++}`);
       values.push(JSON.stringify(mergeJsonValues(ev.comments ?? {}, comments)));
     }
-    if (attendance !== undefined) {
-      setClauses.push(`attendance = $${idx++}`);
-      values.push(JSON.stringify(Array.isArray(attendance) ? attendance : ev.attendance ?? []));
-    }
-    if (part_h !== undefined) {
-      setClauses.push(`part_h = $${idx++}`);
-      values.push(JSON.stringify(mergeJsonValues(ev.part_h ?? {}, part_h)));
+    if (Array.isArray(goals)) {
+      const merged = (ev.goals ?? []).map((g) => {
+        const inc = goals.find((x) => x.id === g.id);
+        return inc ? { ...g, achieved: inc.achieved ?? g.achieved, staff: inc.staff ?? g.staff } : g;
+      });
+      setClauses.push(`goals = $${idx++}`);
+      values.push(JSON.stringify(merged));
     }
     setClauses.push(`updated_at = now()`);
     values.push(id);
@@ -501,7 +510,7 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
 router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { scores, comments, attendance, part_h } = req.body ?? {};
+    const { scores, comments } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
@@ -528,16 +537,9 @@ router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
 
     const finalScores = mergeJsonValues(ev.scores ?? {}, scores ?? {});
     const finalComments = mergeJsonValues(ev.comments ?? {}, comments ?? {});
-    const finalAttendance = Array.isArray(attendance) ? attendance : ev.attendance ?? [];
-    const finalPartH = mergeJsonValues(ev.part_h ?? {}, part_h ?? {});
-    const hasBodyData = !!(
-      (finalScores && Object.keys(finalScores).length > 0) ||
-      (finalComments && Object.keys(finalComments).length > 0) ||
-      (Array.isArray(finalAttendance) && finalAttendance.length > 0) ||
-      (finalPartH && Object.keys(finalPartH).length > 0)
-    );
-    if (!hasBodyData) {
-      return res.status(400).json({ error: 'Fill in your self-assessment before submitting.' });
+
+    if (!hasValue(finalScores)) {
+      return res.status(400).json({ error: 'Fill in your self-assessment scores before submitting.' });
     }
 
     const newLog = appendAudit(ev.audit_log, req.user, 'SELF_ASSESSMENT_SUBMITTED', {
@@ -548,19 +550,15 @@ router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
       `UPDATE evaluations
        SET status = 'supervisor_assessment',
            supervisor_id = $1,
-           attendance = $2,
-           scores = $3,
-           comments = $4,
-           part_h = $5,
-           audit_log = $6,
+           scores = $2,
+           comments = $3,
+           audit_log = $4,
            updated_at = now()
-       WHERE id = $7 RETURNING *`,
+       WHERE id = $5 RETURNING *`,
       [
         supervisorId,
-        JSON.stringify(finalAttendance),
         JSON.stringify(finalScores),
         JSON.stringify(finalComments),
-        JSON.stringify(finalPartH),
         JSON.stringify(newLog),
         id,
       ]
