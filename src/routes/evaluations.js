@@ -16,6 +16,7 @@ import { query, getClient } from '../db.js';
 import { canReassign, canSign, departureWaivers } from '../lib/rules.js';
 
 const router = Router();
+const SELF_EDITABLE = ['draft', 'goals_set', 'self_assessment'];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -192,6 +193,49 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   }
 });
 
+// ── GET /evaluations/:id/self-assessment ──────────────────────────────────
+router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
+  try {
+    const ev = await getEvalOrFail(res, req.params.id, null);
+    if (!ev) return;
+
+    const canRead =
+      req.user.role === 'admin' ||
+      ev.employee_id === req.user.id ||
+      ev.supervisor_id === req.user.id;
+    if (!canRead) {
+      return res.status(403).json({ error: 'Forbidden: you do not have permission to view this self-assessment.' });
+    }
+
+    const { rows: names } = await query(
+      'SELECT id, name FROM users WHERE id = ANY($1)',
+      [[ev.employee_id, ev.supervisor_id].filter(Boolean)]
+    );
+    const nameOf = (uid) => names.find((u) => u.id === uid)?.name ?? null;
+
+    const submission = [...(ev.audit_log ?? [])]
+      .reverse()
+      .find((entry) => entry.action === 'SELF_ASSESSMENT_SUBMITTED');
+
+    res.json({
+      evaluationId: ev.id,
+      period: ev.period,
+      status: ev.status,
+      employee: { id: ev.employee_id, name: nameOf(ev.employee_id) },
+      supervisor: { id: ev.supervisor_id, name: nameOf(ev.supervisor_id) },
+      submitted: !SELF_EDITABLE.includes(ev.status),
+      submittedAt: submission?.timestamp ?? null,
+      waived: !!ev.waived_self_assessment_note,
+      waivedNote: ev.waived_self_assessment_note ?? null,
+      goals: ev.goals,
+      scores: ev.scores,
+      comments: ev.comments,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── PATCH /evaluations/:id/goals ──────────────────────────────────────────
 router.patch('/:id/goals', requireAuth, async (req, res, next) => {
   try {
@@ -296,6 +340,10 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden.' });
     }
 
+    if (ev.employee_id === req.user.id && req.user.role !== 'admin' && !SELF_EDITABLE.includes(ev.status)) {
+      return res.status(422).json({ error: 'Your self-assessment has been submitted and can no longer be edited.' });
+    }
+
     const setClauses = [];
     const values = [];
     let idx = 1;
@@ -324,6 +372,7 @@ router.patch('/:id/self', requireAuth, async (req, res, next) => {
 router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
+    const { scores, comments } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
@@ -331,9 +380,49 @@ router.post('/:id/self/submit', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden.' });
     }
 
+    if (!SELF_EDITABLE.includes(ev.status)) {
+      return res.status(422).json({
+        error: `Self-assessment has already been submitted (current status: ${ev.status}).`,
+      });
+    }
+
+    const { rows: uRows } = await query(
+      'SELECT supervisor_id FROM users WHERE id = $1',
+      [ev.employee_id]
+    );
+    const supervisorId = ev.supervisor_id || uRows[0]?.supervisor_id || null;
+    if (!supervisorId) {
+      return res.status(422).json({
+        error: 'No supervisor is assigned to this employee. Ask an admin to assign one before submitting.',
+      });
+    }
+
+    const finalScores = mergeJsonValues(ev.scores ?? {}, scores ?? {});
+    const finalComments = mergeJsonValues(ev.comments ?? {}, comments ?? {});
+    if (!finalScores || Object.keys(finalScores).length === 0) {
+      return res.status(400).json({ error: 'Fill in your self-assessment scores before submitting.' });
+    }
+
+    const newLog = appendAudit(ev.audit_log, req.user, 'SELF_ASSESSMENT_SUBMITTED', {
+      supervisorId,
+    });
+
     const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'self_assessment', updated_at = now() WHERE id = $1 RETURNING *`,
-      [id]
+      `UPDATE evaluations
+       SET status = 'supervisor_assessment',
+           supervisor_id = $1,
+           scores = $2,
+           comments = $3,
+           audit_log = $4,
+           updated_at = now()
+       WHERE id = $5 RETURNING *`,
+      [
+        supervisorId,
+        JSON.stringify(finalScores),
+        JSON.stringify(finalComments),
+        JSON.stringify(newLog),
+        id,
+      ]
     );
     res.json(updated);
   } catch (err) {
