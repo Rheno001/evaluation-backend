@@ -441,3 +441,59 @@ describe('5. deactivated user session rejection', () => {
     expect(afterRes.body.error).toMatch(/expired|authenticated/i);
   });
 });
+
+describe('6. saved signature and review-meeting signature flow', () => {
+  beforeEach(async () => { await resetDb(); });
+
+  it('stores the profile signature and requires both signatures before submitting to executive review', async () => {
+    const sup = await seedUser({ id: 't6-sup', role: 'supervisor', name: 'Supervisor', password: 's3cret' });
+    const emp = await seedUser({ id: 't6-emp', role: 'employee', name: 'Employee', supervisor_id: sup.id, password: 's3cret' });
+    const ev = await seedEvaluation({
+      id: 't6-ev-1',
+      employee_id: emp.id,
+      supervisor_id: sup.id,
+      status: 'review_meeting',
+      part_h_by: sup.id,
+    });
+
+    const sig = 'data:image/png;base64,iVBORw0KGgo=';
+
+    const saveEmpRes = await request(app)
+      .put('/evaluations/signature/me')
+      .set(auth(tokenFor(emp)))
+      .send({ image: sig });
+    expect(saveEmpRes.status).toBe(200);
+
+    const saveSupRes = await request(app)
+      .put('/evaluations/signature/me')
+      .set(auth(tokenFor(sup)))
+      .send({ image: sig });
+    expect(saveSupRes.status).toBe(200);
+
+    const empAttachRes = await request(app)
+      .post(`/evaluations/${ev.id}/attach-signature`)
+      .set(auth(tokenFor(emp)))
+      .send({ slot: 'employee', password: 's3cret' });
+    expect(empAttachRes.status).toBe(200);
+
+    const confirmBeforeSup = await request(app)
+      .post(`/evaluations/${ev.id}/agreed/confirm`)
+      .set(auth(tokenFor(sup)))
+      .send({});
+    expect(confirmBeforeSup.status).toBe(422);
+    expect(confirmBeforeSup.body.error).toMatch(/Both the supervisor and the employee must sign/i);
+
+    const supAttachRes = await request(app)
+      .post(`/evaluations/${ev.id}/attach-signature`)
+      .set(auth(tokenFor(sup)))
+      .send({ slot: 'supervisor', password: 's3cret' });
+    expect(supAttachRes.status).toBe(200);
+
+    const confirmRes = await request(app)
+      .post(`/evaluations/${ev.id}/agreed/confirm`)
+      .set(auth(tokenFor(sup)))
+      .send({});
+    expect(confirmRes.status).toBe(200);
+    expect(confirmRes.body.status).toBe('executive_review');
+  });
+});

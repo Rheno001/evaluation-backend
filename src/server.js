@@ -13,7 +13,7 @@ import evaluationRoutes from './routes/evaluations.js';
 const app = express();
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // CORS — adjust origins for production
 app.use((req, res, next) => {

@@ -9,6 +9,8 @@
 //  Plus the existing step 1-6 endpoints.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import bcrypt from 'bcryptjs';
+import PDFDocument from 'pdfkit';
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireAuth, requireRole } from '../auth.js';
@@ -17,6 +19,8 @@ import { canReassign, canSign, departureWaivers } from '../lib/rules.js';
 
 const router = Router();
 const SELF_EDITABLE = ['draft', 'goals_set', 'self_assessment'];
+const SIG_DATA_URL = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/;
+const MAX_SIG_CHARS = 400_000;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -50,6 +54,48 @@ function mergeJsonValues(existingValue, incomingValue) {
     }
   }
   return merged;
+}
+
+function validSignatureImage(img) {
+  return typeof img === 'string' && img.length <= MAX_SIG_CHARS && SIG_DATA_URL.test(img);
+}
+
+async function checkPassword(userId, password) {
+  const { rows } = await query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+  return bcrypt.compare(password, rows[0]?.password_hash ?? '');
+}
+
+async function resolveSignatureImage(userId, image) {
+  if (image) return validSignatureImage(image) ? image : null;
+  const { rows } = await query('SELECT signature_image FROM users WHERE id = $1', [userId]);
+  return rows[0]?.signature_image ?? null;
+}
+
+async function saveAudit(id, log) {
+  await query('UPDATE evaluations SET audit_log = $1, updated_at = now() WHERE id = $2', [JSON.stringify(log), id]);
+}
+
+function renderValue(doc, value, indent = 0) {
+  if (value == null) return;
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => {
+      doc.font('Helvetica-Bold').fontSize(10).text(`${i + 1}.`, { indent });
+      renderValue(doc, v, indent + 14);
+    });
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      if (v && typeof v === 'object') {
+        doc.font('Helvetica-Bold').fontSize(10).text(k, { indent });
+        renderValue(doc, v, indent + 14);
+      } else {
+        doc.font('Helvetica').fontSize(10).text(`${k}: ${v ?? ''}`, { indent });
+      }
+    }
+    return;
+  }
+  doc.font('Helvetica').fontSize(10).text(String(value), { indent });
 }
 
 async function getEvalOrFail(res, id, client) {
@@ -169,6 +215,79 @@ router.get('/', requireAuth, async (req, res, next) => {
       ));
     }
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /evaluations/signature/me ────────────────────────────────────────
+router.get('/signature/me', requireAuth, async (req, res, next) => {
+  try {
+    const { rows } = await query('SELECT signature_image FROM users WHERE id = $1', [req.user.id]);
+    res.json({ signature: rows[0]?.signature_image ?? null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PUT /evaluations/signature/me ────────────────────────────────────────
+router.put('/signature/me', requireAuth, async (req, res, next) => {
+  try {
+    const { image } = req.body ?? {};
+    if (!validSignatureImage(image)) {
+      return res.status(400).json({ error: 'Provide a PNG or JPEG data URL under 300KB.' });
+    }
+    await query('UPDATE users SET signature_image = $1 WHERE id = $2', [image, req.user.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /evaluations/:id/attach-signature ───────────────────────────────
+router.post('/:id/attach-signature', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { slot, password, image } = req.body ?? {};
+    if (!['employee', 'supervisor'].includes(slot) || !password) {
+      return res.status(400).json({ error: 'slot (employee|supervisor) and password are required.' });
+    }
+
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    if (ev.status !== 'review_meeting') {
+      return res.status(422).json({ error: `Signatures can only be attached during review_meeting (current: ${ev.status}).` });
+    }
+    if (!ev.part_h_by) {
+      return res.status(422).json({ error: 'The supervisor must save the agreed scores before anyone signs.' });
+    }
+    if (slot === 'employee' && ev.employee_id !== req.user.id) {
+      return res.status(403).json({ error: 'Only the employee can sign this slot.' });
+    }
+    if (slot === 'supervisor' && ev.supervisor_id !== req.user.id) {
+      return res.status(403).json({ error: 'Only the assigned supervisor can sign this slot.' });
+    }
+    if (!(await checkPassword(req.user.id, password))) {
+      return res.status(401).json({ error: 'Password confirmation failed.' });
+    }
+
+    const sigs = await loadSignatures(id, null);
+    if (sigs[slot]) return res.status(409).json({ error: `The ${slot} slot is already signed.` });
+
+    const img = await resolveSignatureImage(req.user.id, image);
+    if (!img) {
+      return res.status(400).json({ error: 'No signature provided and none saved on your profile.' });
+    }
+
+    await query(
+      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image)
+       VALUES ($1, $2, $3, $4, $5, 'signed', $6)`,
+      [id, slot, req.user.id, req.user.name, req.user.role, img]
+    );
+
+    const updatedSigs = await loadSignatures(id, null);
+    res.json({ evaluationId: id, signatures: updatedSigs });
   } catch (err) {
     next(err);
   }
@@ -501,6 +620,13 @@ router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden.' });
     }
 
+    const existing = await loadSignatures(id, null);
+    let auditLog = ev.audit_log;
+    if (existing.employee || existing.supervisor) {
+      await query(`DELETE FROM signatures WHERE evaluation_id = $1 AND slot IN ('employee','supervisor')`, [id]);
+      auditLog = appendAudit(ev.audit_log, req.user, 'SIGNATURES_CLEARED_AFTER_EDIT', {});
+    }
+
     const setClauses = [];
     const values = [];
     let idx = 1;
@@ -522,6 +648,8 @@ router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
     }
     setClauses.push(`part_h_by = $${idx++}`);
     values.push(req.user.id);
+    setClauses.push(`audit_log = $${idx++}`);
+    values.push(JSON.stringify(auditLog));
     setClauses.push(`updated_at = now()`);
     values.push(id);
 
@@ -545,12 +673,21 @@ router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden.' });
     }
+    if (ev.status !== 'review_meeting') {
+      return res.status(422).json({ error: `Cannot submit from status ${ev.status}.` });
+    }
 
+    const sigs = await loadSignatures(id, null);
+    if (!sigs.supervisor?.signed_at || !sigs.employee?.signed_at) {
+      return res.status(422).json({ error: 'Both the supervisor and the employee must sign before submitting to the executive.' });
+    }
+
+    const newLog = appendAudit(ev.audit_log, req.user, 'SUBMITTED_TO_EXECUTIVE', {});
     const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'executive_review', updated_at = now() WHERE id = $1 RETURNING *`,
-      [id]
+      `UPDATE evaluations SET status = 'executive_review', audit_log = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [JSON.stringify(newLog), id]
     );
-    res.json(updated);
+    res.json({ ...updated, signatures: sigs });
   } catch (err) {
     next(err);
   }
@@ -560,18 +697,39 @@ router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
 router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
+    const { password, image } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
     if (req.user.role !== 'admin' && req.user.role !== 'executive') {
       return res.status(403).json({ error: 'Forbidden: executive or admin only.' });
     }
+    if (!password) return res.status(400).json({ error: 'password is required to sign.' });
+    if (ev.status !== 'executive_review') {
+      return res.status(422).json({ error: `Evaluation is not awaiting executive review (current: ${ev.status}).` });
+    }
+    if (!(await checkPassword(req.user.id, password))) {
+      return res.status(401).json({ error: 'Password confirmation failed.' });
+    }
 
-    const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'signoff', updated_at = now() WHERE id = $1 RETURNING *`,
-      [id]
+    const sigs = await loadSignatures(id, null);
+    if (sigs.managing_partner) return res.status(409).json({ error: 'Already signed by the executive.' });
+
+    const img = await resolveSignatureImage(req.user.id, image);
+    if (!img) return res.status(400).json({ error: 'No signature provided and none saved on your profile.' });
+
+    await query(
+      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image)
+       VALUES ($1, 'managing_partner', $2, $3, $4, 'signed', $5)`,
+      [id, req.user.id, req.user.name, req.user.role, img]
     );
-    res.json(updated);
+
+    const newLog = appendAudit(ev.audit_log, req.user, 'EXECUTIVE_SIGNED', {});
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'signoff', audit_log = $1, updated_at = now() WHERE id = $2 RETURNING *`,
+      [JSON.stringify(newLog), id]
+    );
+    res.json({ ...updated, signatures: await loadSignatures(id, null) });
   } catch (err) {
     next(err);
   }
@@ -900,7 +1058,7 @@ router.post('/:id/waive-employee-sig', requireAuth, requireRole('admin'), async 
 router.post('/:id/sign', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { slot, password } = req.body ?? {};
+    const { slot, password, image } = req.body ?? {};
     if (!slot || !password) {
       return res.status(400).json({ error: 'slot and password are required.' });
     }
@@ -914,14 +1072,7 @@ router.post('/:id/sign', requireAuth, async (req, res, next) => {
       });
     }
 
-    // Re-authenticate password
-    const bcrypt = await import('bcryptjs');
-    const { rows: userRows } = await query(
-      'SELECT password_hash FROM users WHERE id = $1',
-      [req.user.id]
-    );
-    const valid = await bcrypt.default.compare(password, userRows[0]?.password_hash ?? '');
-    if (!valid) {
+    if (!(await checkPassword(req.user.id, password))) {
       return res.status(401).json({ error: 'Password confirmation failed. Incorrect password.' });
     }
 
@@ -935,10 +1086,15 @@ router.post('/:id/sign', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: `Forbidden: you cannot sign the ${slot} slot at this time.` });
     }
 
+    const img = await resolveSignatureImage(req.user.id, image);
+    if (!img) {
+      return res.status(400).json({ error: 'No signature provided and none saved on your profile.' });
+    }
+
     await query(
-      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type)
-       VALUES ($1, $2, $3, $4, $5, 'signed')`,
-      [id, slot, req.user.id, req.user.name, req.user.role]
+      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image)
+       VALUES ($1, $2, $3, $4, $5, 'signed', $6)`,
+      [id, slot, req.user.id, req.user.name, req.user.role, img]
     );
 
     const updatedSigs = await loadSignatures(id, null);
@@ -962,6 +1118,98 @@ router.post('/:id/sign', requireAuth, async (req, res, next) => {
     );
 
     res.json({ ...updated, signatures: updatedSigs });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── GET /evaluations/:id/pdf ───────────────────────────────────────────────
+router.get('/:id/pdf', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const ev = await getEvalOrFail(res, id, null);
+    if (!ev) return;
+
+    const canRead =
+      req.user.role === 'admin' ||
+      req.user.role === 'executive' ||
+      req.user.role === 'hr_officer' ||
+      ev.employee_id === req.user.id ||
+      ev.supervisor_id === req.user.id;
+    if (!canRead) return res.status(403).json({ error: 'Forbidden.' });
+
+    const sigs = await loadSignatures(id, null);
+    if (!sigs.managing_partner?.signed_at) {
+      return res.status(422).json({ error: 'The PDF is available after the executive has signed.' });
+    }
+
+    const { rows: names } = await query(
+      'SELECT id, name FROM users WHERE id = ANY($1)',
+      [[ev.employee_id, ev.supervisor_id].filter(Boolean)]
+    );
+    const nameOf = (uid) => names.find((u) => u.id === uid)?.name ?? '—';
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="evaluation-${id.replace(/[^\w.-]/g, '_')}.pdf"`);
+
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    doc.pipe(res);
+
+    doc.font('Helvetica-Bold').fontSize(18).text('Staff Performance Evaluation', { align: 'center' });
+    doc.moveDown();
+    doc.font('Helvetica').fontSize(11)
+      .text(`Employee: ${nameOf(ev.employee_id)}`)
+      .text(`Supervisor: ${nameOf(ev.supervisor_id)}`)
+      .text(`Period: ${ev.period}`)
+      .text(`Status: ${ev.status}`);
+
+    const sections = [
+      ['Goals', ev.goals],
+      ['Scores', ev.scores],
+      ['Comments', ev.comments],
+      ['Part H', ev.part_h],
+      ['Review Meeting', ev.review_meeting],
+    ];
+    for (const [title, value] of sections) {
+      if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) continue;
+      doc.moveDown().font('Helvetica-Bold').fontSize(13).text(title);
+      doc.moveDown(0.3);
+      renderValue(doc, value);
+    }
+
+    doc.addPage();
+    doc.font('Helvetica-Bold').fontSize(14).text('Signatures');
+    doc.moveDown();
+
+    const slots = [
+      ['employee', 'Employee'],
+      ['supervisor', 'Supervisor'],
+      ['managing_partner', 'Executive'],
+      ['hr_officer', 'HR Officer'],
+    ];
+    for (const [slot, label] of slots) {
+      if (doc.y > 680) doc.addPage();
+      const sig = sigs[slot];
+      doc.font('Helvetica-Bold').fontSize(11).text(label, 50);
+      if (!sig) {
+        doc.font('Helvetica').fontSize(10).text('Not signed', 50);
+        doc.moveDown();
+        continue;
+      }
+      const y = doc.y;
+      if (sig.type === 'waived') {
+        doc.font('Helvetica-Oblique').fontSize(10).text(`Waived: ${sig.note ?? ''}`, 50);
+      } else if (sig.image) {
+        const buf = Buffer.from(sig.image.split(',')[1], 'base64');
+        doc.image(buf, 50, y, { fit: [180, 55] });
+        doc.y = y + 60;
+      }
+      doc.font('Helvetica').fontSize(10)
+        .text(`${sig.signer_name} · ${new Date(sig.signed_at).toLocaleString()}`, 50);
+      doc.moveDown();
+    }
+
+    doc.end();
   } catch (err) {
     next(err);
   }

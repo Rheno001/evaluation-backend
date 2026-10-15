@@ -123,6 +123,7 @@ export async function seedEvaluation(overrides = {}) {
     comments:       { B: { staff: '', supervisor: '' }, C: { staff: '', supervisor: '' }, D: { staff: '', supervisor: '' }, E: { staff: '', supervisor: '' } },
     part_h:         { strengths: '', developmentAreas: '', agreedActions: '', reviewDate: '' },
     review_meeting: {},
+    part_h_by:      null,
     departure:      null,
     audit_log:      [],
   };
@@ -131,10 +132,10 @@ export async function seedEvaluation(overrides = {}) {
     `INSERT INTO evaluations
        (id, employee_id, supervisor_id, period, status,
         attendance, goals, scores, comments, part_h, review_meeting,
-        departure, audit_log)
+        part_h_by, departure, audit_log)
      VALUES ($1,$2,$3,$4,$5,
              $6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,
-             $12::jsonb,$13::jsonb)`,
+             $12,$13::jsonb,$14::jsonb)`,
     [
       e.id, e.employee_id, e.supervisor_id, e.period, e.status,
       JSON.stringify(e.attendance),
@@ -143,6 +144,7 @@ export async function seedEvaluation(overrides = {}) {
       JSON.stringify(e.comments),
       JSON.stringify(e.part_h),
       JSON.stringify(e.review_meeting),
+      e.part_h_by,
       e.departure ? JSON.stringify(e.departure) : null,
       JSON.stringify(e.audit_log),
     ]
