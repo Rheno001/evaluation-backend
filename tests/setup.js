@@ -42,13 +42,13 @@ export async function resetDb() {
 export async function seedUser(overrides = {}) {
   const defaults = {
     id:              `u-${Math.random().toString(36).slice(2, 8)}`,
-    name:            'Test User',
-    email:           `test-${Math.random().toString(36).slice(2, 8)}@cpp.test`,
-    password:        'password123',
+    name:            'User',
+    email:           `user-${Math.random().toString(36).slice(2, 8)}@example.invalid`,
+    password:        'replace-with-real-password',
     role:            'employee',
     department:      'Engineering',
     position:        'Engineer',
-    avatar_initials: 'TU',
+    avatar_initials: 'U',
     supervisor_id:   null,
     active:          true,
     start_date:      '2023-01-01',
