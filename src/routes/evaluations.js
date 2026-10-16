@@ -88,6 +88,18 @@ async function saveAudit(id, log) {
   await query('UPDATE evaluations SET audit_log = $1, updated_at = now() WHERE id = $2', [JSON.stringify(log), id]);
 }
 
+async function getEvalOrFail(res, id, client) {
+  const q = client ?? query;
+  const { rows } = await (client
+    ? client.query('SELECT * FROM evaluations WHERE id = $1', [id])
+    : query('SELECT * FROM evaluations WHERE id = $1', [id]));
+  if (!rows[0]) {
+    res.status(404).json({ error: `Evaluation ${id} not found.` });
+    return null;
+  }
+  return rows[0];
+}
+
 // ── PDF design ───────────────────────────────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOGO = (() => {
