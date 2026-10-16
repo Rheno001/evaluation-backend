@@ -9,6 +9,9 @@
 //  Plus the existing step 1-6 endpoints.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import PDFDocument from 'pdfkit';
 import { Router } from 'express';
@@ -85,134 +88,333 @@ async function saveAudit(id, log) {
   await query('UPDATE evaluations SET audit_log = $1, updated_at = now() WHERE id = $2', [JSON.stringify(log), id]);
 }
 
-function renderValue(doc, value, indent = 0) {
-  if (value == null) return;
-  if (Array.isArray(value)) {
-    value.forEach((v, i) => {
-      doc.font('Helvetica-Bold').fontSize(10).text(`${i + 1}.`, { indent });
-      renderValue(doc, v, indent + 14);
-    });
-    return;
+// ── PDF design ───────────────────────────────────────────────────────────────
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const LOGO = (() => {
+  try { return fs.readFileSync(path.join(__dirname, '../assets/cpp-logo.png')); }
+  catch { return null; }
+})();
+
+const C = { brand: '#9CC13B', ink: '#0F172A', muted: '#64748B', line: '#E2E8F0', band: '#F8FAFC' };
+const X0 = 50;
+const CW = 495;
+
+const fmtDate = (d) => d
+  ? new Date(d).toLocaleDateString('en-GB', { timeZone: 'Africa/Lagos', day: '2-digit', month: 'short', year: 'numeric' })
+  : '—';
+const fmtDateTime = (d) => d
+  ? new Date(d).toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+  : '—';
+const r = (v) => (v === null || v === undefined || v === '' ? '–' : String(v));
+const s1 = (n) => (typeof n === 'number' ? n.toFixed(1) : '–');
+
+// Score formula: average rating (1-5) / 5 x part weight. Weights: B 10, C 55, D 10, E 25.
+const avg = (vals) => {
+  const v = vals.filter((x) => typeof x === 'number');
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+};
+const part = (vals, weight) => { const a = avg(vals); return a === null ? null : (a / 5) * weight; };
+function computeScores(ev, key) {
+  const pick = (grp) => Object.values(ev.scores?.[grp] ?? {}).map((x) => x?.[key]);
+  const B = part(pick('B'), 10);
+  const Cc = part((ev.goals ?? []).map((g) => g?.[key]), 55);
+  const D = part(pick('D'), 10);
+  const E = part(pick('E'), 25);
+  const total = [B, Cc, D, E].some((x) => x === null) ? null : B + Cc + D + E;
+  return { B, C: Cc, D, E, total };
+}
+
+const CRITERIA = {
+  B: [['meetingAttendanceRate', 'Meeting attendance rate'], ['punctuality', 'Punctuality'],
+      ['participation', 'Active participation'], ['advanceNotice', 'Advance notice of absence']],
+  D: [['timeManagement', 'Time management & deadline discipline']],
+  E: [['communication', 'Communication & honesty'], ['ownership', 'Ownership & accountability'],
+      ['quality', 'Quality & attention to detail'], ['teamwork', 'Teamwork & collaboration'],
+      ['clientFocus', 'Client & service focus']],
+};
+
+function drawHeader(doc, subtitle) {
+  const top = 36;
+  let logoDrawn = false;
+  if (LOGO) {
+    try { doc.image(LOGO, X0, top, { fit: [130, 42] }); logoDrawn = true; } catch { /* fall back to text */ }
   }
-  if (typeof value === 'object') {
-    for (const [k, v] of Object.entries(value)) {
-      if (v && typeof v === 'object') {
-        doc.font('Helvetica-Bold').fontSize(10).text(k, { indent });
-        renderValue(doc, v, indent + 14);
-      } else {
-        doc.font('Helvetica').fontSize(10).text(`${k}: ${v ?? ''}`, { indent });
-      }
+  if (!logoDrawn) {
+    doc.font('Helvetica-Bold').fontSize(15).fillColor(C.ink).text('CPP GROUP', X0, top + 12, { lineBreak: false });
+  }
+  doc.font('Helvetica').fontSize(8.5).fillColor(C.muted)
+    .text(subtitle, 300, top + 16, { width: 245, align: 'right', lineBreak: false });
+  doc.moveTo(X0, top + 52).lineTo(X0 + CW, top + 52).lineWidth(2).strokeColor(C.brand).stroke();
+  doc.x = X0;
+  doc.y = top + 68;
+}
+
+function ensureSpace(doc, needed) {
+  if (doc.y + needed > doc.page.height - 70) doc.addPage(); // header is redrawn by the pageAdded hook
+}
+
+function sectionTitle(doc, text) {
+  ensureSpace(doc, 70);
+  doc.font('Helvetica-Bold').fontSize(11).fillColor(C.ink)
+    .text(text.toUpperCase(), X0, doc.y, { characterSpacing: 0.6 });
+  const y = doc.y + 3;
+  doc.moveTo(X0, y).lineTo(X0 + CW, y).lineWidth(0.75).strokeColor(C.line).stroke();
+  doc.x = X0;
+  doc.y = y + 10;
+}
+
+function infoGrid(doc, items) {
+  const top = doc.y + 4;
+  const h = 58;
+  doc.roundedRect(X0, top, CW, h, 6).fillAndStroke(C.band, C.line);
+  const colW = CW / items.length;
+  items.forEach(([label, value], i) => {
+    const x = X0 + i * colW + 14;
+    doc.fillColor(C.muted).font('Helvetica-Bold').fontSize(7.5)
+      .text(label.toUpperCase(), x, top + 14, { width: colW - 20, lineBreak: false });
+    doc.fillColor(C.ink).font('Helvetica-Bold').fontSize(12)
+      .text(String(value ?? '—'), x, top + 29, { width: colW - 20, lineBreak: false });
+  });
+  doc.x = X0;
+  doc.y = top + h + 18;
+}
+
+function cellHeight(doc, cell, w, bold) {
+  if (cell && typeof cell === 'object') {
+    doc.font('Helvetica-Bold').fontSize(9.5);
+    let h = doc.heightOfString(String(cell.title ?? ''), { width: w });
+    if (cell.sub) {
+      doc.font('Helvetica').fontSize(8.5);
+      h += 2 + doc.heightOfString(String(cell.sub), { width: w });
+    }
+    return h;
+  }
+  doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(9.5);
+  return doc.heightOfString(String(cell ?? ''), { width: w });
+}
+
+function drawCell(doc, cell, x, y, w, { bold, color, align }) {
+  if (cell && typeof cell === 'object') {
+    doc.font('Helvetica-Bold').fontSize(9.5).fillColor(C.ink).text(String(cell.title ?? ''), x, y, { width: w });
+    if (cell.sub) {
+      doc.font('Helvetica').fontSize(8.5).fillColor(C.muted).text(String(cell.sub), x, doc.y + 2, { width: w });
     }
     return;
   }
-  doc.font('Helvetica').fontSize(10).text(String(value), { indent });
+  doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(9.5).fillColor(color)
+    .text(String(cell ?? ''), x, y, { width: w, align });
 }
 
-async function getEvalOrFail(res, id, client) {
-  const q = client ?? query;
-  const { rows } = await (client
-    ? client.query('SELECT * FROM evaluations WHERE id = $1', [id])
-    : query('SELECT * FROM evaluations WHERE id = $1', [id]));
-  if (!rows[0]) {
-    res.status(404).json({ error: `Evaluation ${id} not found.` });
-    return null;
-  }
-  return rows[0];
+function table(doc, cols, rows) {
+  const pad = 7;
+  const out = (cells, { header = false, strong = false, zebra = false } = {}) => {
+    const bold = header || strong;
+    const h = Math.max(...cells.map((c, i) => cellHeight(doc, c, cols[i].width - pad * 2, bold))) + pad * 2;
+    ensureSpace(doc, h + 4);
+    const y = doc.y;
+    if (header) doc.rect(X0, y, CW, h).fill(C.ink);
+    else if (strong) doc.rect(X0, y, CW, h).fill('#ECF3D6');
+    else if (zebra) doc.rect(X0, y, CW, h).fill(C.band);
+    let x = X0;
+    cells.forEach((c, i) => {
+      drawCell(doc, c, x + pad, y + pad, cols[i].width - pad * 2, {
+        bold, color: header ? '#FFFFFF' : C.ink, align: cols[i].align || 'left',
+      });
+      x += cols[i].width;
+    });
+    doc.moveTo(X0, y + h).lineTo(X0 + CW, y + h).lineWidth(0.5).strokeColor(C.line).stroke();
+    doc.x = X0;
+    doc.y = y + h;
+  };
+
+  out(cols.map((c) => c.label), { header: true });
+  rows.forEach((row, i) => {
+    if (row.group) {
+      const h = 22;
+      ensureSpace(doc, h + 30);
+      const y = doc.y;
+      doc.rect(X0, y, CW, h).fill('#EEF2F7');
+      doc.font('Helvetica-Bold').fontSize(9).fillColor(C.ink).text(row.group, X0 + pad, y + 6, { width: CW - pad * 2, lineBreak: false });
+      doc.x = X0;
+      doc.y = y + h;
+    } else {
+      out(row.cells, { strong: !!row.strong, zebra: i % 2 === 1 });
+    }
+  });
+  doc.moveDown(1);
 }
 
-/** Load signature rows for an evaluation, returns object keyed by slot. */
-async function loadSignatures(evalId, client) {
-  const q = client ?? query;
-  const fn = client
-    ? (sql, p) => client.query(sql, p)
-    : query;
-  const { rows } = await fn(
-    'SELECT * FROM signatures WHERE evaluation_id = $1',
-    [evalId]
-  );
-  const map = {};
-  for (const sig of rows) {
-    map[sig.slot] = sig;
-  }
-  return map;
+function textBlock(doc, label, value) {
+  const text = String(value ?? '').trim() || 'None recorded';
+  doc.font('Helvetica').fontSize(10);
+  const vh = doc.heightOfString(text, { width: CW });
+  ensureSpace(doc, vh + 30);
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(C.muted)
+    .text(label.toUpperCase(), X0, doc.y, { width: CW, characterSpacing: 0.5 });
+  doc.font('Helvetica').fontSize(10).fillColor(C.ink).text(text, X0, doc.y + 3, { width: CW });
+  doc.x = X0;
+  doc.moveDown(0.8);
 }
 
-async function loadEvalForPdf(id) {
-  const { rows } = await query('SELECT * FROM evaluations WHERE id = $1', [id]);
-  const ev = rows[0];
-  if (!ev) return null;
-  const sigs = await loadSignatures(id, null);
-  const { rows: names } = await query(
-    'SELECT id, name FROM users WHERE id = ANY($1)',
-    [[ev.employee_id, ev.supervisor_id].filter(Boolean)]
-  );
-  const nameOf = (uid) => names.find((u) => u.id === uid)?.name ?? '—';
-  return { ev, sigs, nameOf };
+function signatureBoxes(doc, sigs) {
+  const slots = [['employee', 'Employee'], ['supervisor', 'Supervisor'], ['hr_officer', 'HR Officer']];
+  const w = 155, gap = 15, h = 130;
+  ensureSpace(doc, h + 40);
+  const top = doc.y;
+  slots.forEach(([slot, label], i) => {
+    const x = X0 + i * (w + gap);
+    const sig = sigs[slot];
+    doc.roundedRect(x, top, w, h, 6).lineWidth(0.75).strokeColor(C.line).stroke();
+    doc.fillColor(C.muted).font('Helvetica-Bold').fontSize(8)
+      .text(label.toUpperCase(), x + 10, top + 10, { width: w - 20, lineBreak: false, characterSpacing: 0.5 });
+
+    if (!sig) {
+      doc.font('Helvetica-Oblique').fontSize(9).fillColor(C.muted).text('Not signed', x + 10, top + 50, { width: w - 20 });
+      return;
+    }
+    if (sig.type === 'waived') {
+      doc.font('Helvetica-Oblique').fontSize(9).fillColor(C.muted)
+        .text(`Waived: ${sig.note ?? ''}`, x + 10, top + 30, { width: w - 20, height: 40 });
+    } else if (sig.image) {
+      try {
+        doc.image(Buffer.from(sig.image.split(',')[1], 'base64'), x + 10, top + 26, { fit: [w - 20, 48], align: 'left' });
+      } catch {
+        doc.font('Helvetica-Oblique').fontSize(8).fillColor(C.muted).text('[signature could not be rendered]', x + 10, top + 40, { width: w - 20 });
+      }
+    }
+    doc.moveTo(x + 10, top + 80).lineTo(x + w - 10, top + 80).lineWidth(0.5).strokeColor(C.line).stroke();
+    doc.font('Helvetica-Bold').fontSize(9).fillColor(C.ink)
+      .text(String(sig.signer_name ?? ''), x + 10, top + 86, { width: w - 20, lineBreak: false });
+    doc.font('Helvetica').fontSize(8).fillColor(C.muted)
+      .text(fmtDateTime(sig.signed_at), x + 10, top + 100, { width: w - 20, lineBreak: false });
+    if (sig.type === 'captured') {
+      doc.font('Helvetica-Oblique').fontSize(7.5).fillColor(C.muted)
+        .text('Captured in person', x + 10, top + 112, { width: w - 20, lineBreak: false });
+    }
+  });
+  doc.x = X0;
+  doc.y = top + h + 12;
+  doc.font('Helvetica').fontSize(8).fillColor(C.muted)
+    .text("Each signature was confirmed with the signer's password at the time of signing.", X0, doc.y, { width: CW });
 }
 
 function drawEvaluationPdf(doc, { ev, sigs, nameOf }) {
-  doc.font('Helvetica-Bold').fontSize(18).text('Staff Performance Evaluation', { align: 'center' });
-  doc.moveDown();
-  doc.font('Helvetica').fontSize(11)
-    .text(`Employee: ${nameOf(ev.employee_id)}`)
-    .text(`Supervisor: ${nameOf(ev.supervisor_id)}`)
-    .text(`Period: ${ev.period}`);
+  const staff = computeScores(ev, 'staff');
+  const sup = computeScores(ev, 'supervisor');
+  const agreed = computeScores(ev, 'agreed');
 
-  const sections = [
-    ['Goals', ev.goals],
-    ['Scores', ev.scores],
-    ['Comments', ev.comments],
-    ['Part H — Growth & Development', ev.part_h],
-    ['Review Meeting', ev.review_meeting],
-    ['Part I — Leader Review', ev.part_i?.comment],
-  ];
-  for (const [title, value] of sections) {
-    if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) continue;
-    doc.moveDown().font('Helvetica-Bold').fontSize(13).text(title);
-    doc.moveDown(0.3);
-    renderValue(doc, value);
+  doc.font('Helvetica-Bold').fontSize(20).fillColor(C.ink).text('Staff Performance Evaluation', X0, doc.y);
+  doc.font('Helvetica').fontSize(10).fillColor(C.muted).text(`Performance review · ${ev.period}`);
+  doc.moveDown(0.8);
+
+  infoGrid(doc, [
+    ['Employee', nameOf(ev.employee_id)],
+    ['Supervisor', nameOf(ev.supervisor_id)],
+    ['Period', ev.period],
+    ['Overall score', agreed.total === null ? '–' : `${agreed.total.toFixed(1)} / 100`],
+  ]);
+
+  sectionTitle(doc, 'Score summary');
+  table(doc,
+    [{ label: 'PART', width: 195 }, { label: 'WEIGHT', width: 60, align: 'center' },
+     { label: 'STAFF', width: 80, align: 'center' }, { label: 'SUPERVISOR', width: 80, align: 'center' },
+     { label: 'AGREED', width: 80, align: 'center' }],
+    [
+      { cells: ['B — Attendance & Participation', '10%', s1(staff.B), s1(sup.B), s1(agreed.B)] },
+      { cells: ['C — Outcomes & Results', '55%', s1(staff.C), s1(sup.C), s1(agreed.C)] },
+      { cells: ['D — Time Management', '10%', s1(staff.D), s1(sup.D), s1(agreed.D)] },
+      { cells: ['E — Professional Behaviours', '25%', s1(staff.E), s1(sup.E), s1(agreed.E)] },
+      { strong: true, cells: ['Total', '100%', s1(staff.total), s1(sup.total), s1(agreed.total)] },
+    ]);
+
+  const crit = (grp) => CRITERIA[grp].map(([k, label]) => {
+    const x = ev.scores?.[grp]?.[k] ?? {};
+    return { cells: [{ title: label, sub: x.evidence ? `Staff evidence: ${x.evidence}` : '' }, r(x.staff), r(x.supervisor), r(x.agreed)] };
+  });
+  const goalRows = (ev.goals ?? []).map((g, i) => ({
+    cells: [
+      { title: `Goal ${i + 1}: ${g.outcome ?? ''}`,
+        sub: [g.measure && `Measure: ${g.measure}`, g.achieved && `Achieved: ${g.achieved}`].filter(Boolean).join('\n') },
+      r(g.staff), r(g.supervisor), r(g.agreed),
+    ],
+  }));
+
+  sectionTitle(doc, 'Detailed ratings (1 to 5)');
+  table(doc,
+    [{ label: 'CRITERION', width: 255 }, { label: 'STAFF', width: 80, align: 'center' },
+     { label: 'SUPERVISOR', width: 80, align: 'center' }, { label: 'AGREED', width: 80, align: 'center' }],
+    [
+      { group: 'Part B — Attendance & Participation' }, ...crit('B'),
+      { group: 'Part C — Outcomes & Results' }, ...goalRows,
+      { group: 'Part D — Time Management' }, ...crit('D'),
+      { group: 'Part E — Professional Behaviours' }, ...crit('E'),
+    ]);
+
+  const labels = { B: 'Attendance & Participation', C: 'Outcomes & Results', D: 'Time Management', E: 'Professional Behaviours' };
+  const commentRows = ['B', 'C', 'D', 'E']
+    .map((k) => ({ k, c: ev.comments?.[k] ?? {} }))
+    .filter(({ c }) => String(c.staff ?? '').trim() || String(c.supervisor ?? '').trim())
+    .map(({ k, c }) => ({ cells: [{ title: `${k} — ${labels[k]}` }, String(c.staff ?? '').trim() || '–', String(c.supervisor ?? '').trim() || '–'] }));
+  if (commentRows.length) {
+    sectionTitle(doc, 'Comments');
+    table(doc,
+      [{ label: 'PART', width: 165 }, { label: 'STAFF', width: 165 }, { label: 'SUPERVISOR', width: 165 }],
+      commentRows);
   }
 
-  doc.addPage();
-  doc.font('Helvetica-Bold').fontSize(14).text('Part J — Digital Sign-off & Confirmation');
-  doc.moveDown();
-  const slots = [['employee', 'Employee'], ['supervisor', 'Supervisor'], ['hr_officer', 'HR Officer']];
-  for (const [slot, label] of slots) {
-    if (doc.y > 640) doc.addPage();
-    const sig = sigs[slot];
-    doc.font('Helvetica-Bold').fontSize(11).text(label, 50);
-    const top = doc.y + 4;
-    if (!sig) {
-      doc.font('Helvetica-Oblique').fontSize(10).text('Not signed', 50, top);
-      doc.y = top + 20;
-      continue;
-    }
-    if (sig.type === 'waived') {
-      doc.font('Helvetica-Oblique').fontSize(10).text(`Waived: ${sig.note ?? ''}`, 50, top);
-    } else if (sig.image) {
-      try {
-        doc.image(Buffer.from(sig.image.split(',')[1], 'base64'), 50, top, { fit: [180, 55] });
-      } catch {
-        doc.font('Helvetica-Oblique').fontSize(10).text('[signature image could not be rendered]', 50, top);
-      }
-    }
-    doc.y = top + 62;
-    doc.font('Helvetica').fontSize(9).text(
-      `${sig.signer_name} · ${new Date(sig.signed_at).toLocaleString()}${sig.type === 'captured' ? ' · captured in person' : ''}`,
-      50
-    );
-    doc.moveDown();
+  sectionTitle(doc, 'Part H — Growth & Development');
+  textBlock(doc, 'Key strengths', ev.part_h?.strengths);
+  textBlock(doc, 'Development areas', ev.part_h?.developmentAreas);
+  textBlock(doc, 'Agreed actions & support required', ev.part_h?.agreedActions);
+  if (ev.part_h?.reviewDate) textBlock(doc, 'Follow-up review date', fmtDate(ev.part_h.reviewDate));
+
+  sectionTitle(doc, 'Review meeting');
+  textBlock(doc, 'Meeting date', ev.review_meeting?.date ? fmtDate(ev.review_meeting.date) : '');
+  textBlock(doc, 'Discussion notes', ev.review_meeting?.notes);
+
+  sectionTitle(doc, 'Part I — Executive Leader Comments');
+  textBlock(doc, 'Leader comment', ev.part_i?.comment);
+  if (ev.part_i?.authorName) {
+    doc.font('Helvetica-Oblique').fontSize(8.5).fillColor(C.muted)
+      .text(`— ${ev.part_i.authorName}, ${fmtDate(ev.part_i.submittedAt)}`, X0, doc.y - 4);
+    doc.moveDown(0.8);
+  }
+
+  sectionTitle(doc, 'Part J — Digital Sign-off & Confirmation');
+  signatureBoxes(doc, sigs);
+}
+
+function addFooters(doc, evaluationId) {
+  const range = doc.bufferedPageRange();
+  for (let i = range.start; i < range.start + range.count; i++) {
+    doc.switchToPage(i);
+    const bottom = doc.page.margins.bottom;
+    doc.page.margins.bottom = 0;
+    doc.font('Helvetica').fontSize(8).fillColor(C.muted)
+      .text(`CPP Group · Confidential · ${evaluationId}`, X0, doc.page.height - 40, { width: 350, lineBreak: false })
+      .text(`Page ${i + 1} of ${range.count}`, 400, doc.page.height - 40, { width: 145, align: 'right', lineBreak: false });
+    doc.page.margins.bottom = bottom;
   }
 }
 
 function buildPdfBuffer(data) {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    const subtitle = `${data.nameOf(data.ev.employee_id)} · ${data.ev.period}`;
+    const doc = new PDFDocument({
+      margin: 50, size: 'A4', bufferPages: true,
+      info: { Title: `Staff Performance Evaluation - ${subtitle}`, Author: 'CPP Group' },
+    });
     const chunks = [];
     doc.on('data', (c) => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
-    try { drawEvaluationPdf(doc, data); doc.end(); } catch (e) { reject(e); }
+    try {
+      doc.on('pageAdded', () => drawHeader(doc, subtitle));
+      drawHeader(doc, subtitle);
+      drawEvaluationPdf(doc, data);
+      addFooters(doc, data.ev.id);
+      doc.end();
+    } catch (e) { reject(e); }
   });
 }
 
@@ -1256,6 +1458,13 @@ router.get('/:id/pdf', requireAuth, async (req, res, next) => {
         return res.status(422).json({ error: 'The PDF is available once HR has signed.' });
       }
       pdf = await buildPdfBuffer(data);
+      if (ev.status === 'locked') {
+        await query(
+          `INSERT INTO evaluation_archives (evaluation_id, pdf, created_by)
+           VALUES ($1,$2,$3) ON CONFLICT (evaluation_id) DO NOTHING`,
+          [id, pdf, req.user.id]
+        );
+      }
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="evaluation-${id.replace(/[^\w.-]/g, '_')}.pdf"`);
