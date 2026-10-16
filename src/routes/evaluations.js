@@ -269,14 +269,31 @@ router.post('/:id/attach-signature', requireAuth, async (req, res, next) => {
       return res.status(422).json({ error: `Signatures can only be attached during review_meeting (current: ${ev.status}).` });
     }
     if (!ev.part_h_by) {
-      return res.status(422).json({ error: 'The supervisor must save the agreed scores before anyone signs.' });
+      return res.status(422).json({ error: 'Save the agreed scores before anyone signs.' });
     }
-    if (slot === 'employee' && ev.employee_id !== req.user.id) {
-      return res.status(403).json({ error: 'Only the employee can sign this slot.' });
+
+    const isSupervisor = ev.supervisor_id === req.user.id;
+    const isEmployee = ev.employee_id === req.user.id;
+    let type = 'signed';
+    let img;
+
+    if (slot === 'supervisor') {
+      if (!isSupervisor) return res.status(403).json({ error: 'Only the assigned supervisor can sign this slot.' });
+      img = await resolveSignatureImage(req.user.id, image);
+    } else if (isEmployee) {
+      img = await resolveSignatureImage(req.user.id, image);
+    } else if (isSupervisor) {
+      // supervisor captures the employee's signature in person: must be freshly drawn
+      if (!validSignatureImage(image)) {
+        return res.status(400).json({ error: "Draw the employee's signature on screen." });
+      }
+      img = image;
+      type = 'captured';
+    } else {
+      return res.status(403).json({ error: 'You cannot sign this slot.' });
     }
-    if (slot === 'supervisor' && ev.supervisor_id !== req.user.id) {
-      return res.status(403).json({ error: 'Only the assigned supervisor can sign this slot.' });
-    }
+
+    if (!img) return res.status(400).json({ error: 'No signature provided.' });
     if (!(await checkPassword(req.user.id, password))) {
       return res.status(401).json({ error: 'Password confirmation failed.' });
     }
@@ -284,22 +301,17 @@ router.post('/:id/attach-signature', requireAuth, async (req, res, next) => {
     const sigs = await loadSignatures(id, null);
     if (sigs[slot]) return res.status(409).json({ error: `The ${slot} slot is already signed.` });
 
-    const img = await resolveSignatureImage(req.user.id, image);
-    if (!img) {
-      return res.status(400).json({ error: 'No signature provided and none saved on your profile.' });
-    }
-
+    // for 'captured', signer_* is the supervisor who entered it; the audit entry names the employee
     await query(
-      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image)
-       VALUES ($1, $2, $3, $4, $5, 'signed', $6)`,
-      [id, slot, req.user.id, req.user.name, req.user.role, img]
+      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [id, slot, req.user.id, req.user.name, req.user.role, type, img,
+       type === 'captured' ? 'Captured in person by supervisor' : null]
     );
 
-    const updatedSigs = await loadSignatures(id, null);
-    res.json({ evaluationId: id, signatures: updatedSigs });
-  } catch (err) {
-    next(err);
-  }
+    await saveAudit(id, appendAudit(ev.audit_log, req.user, 'SIGNATURE_ATTACHED', { slot, type }));
+    res.json({ evaluationId: id, signatures: await loadSignatures(id, null) });
+  } catch (err) { next(err); }
 });
 
 // ── GET /evaluations/:id ──────────────────────────────────────────────────
