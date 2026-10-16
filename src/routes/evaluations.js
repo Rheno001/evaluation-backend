@@ -136,6 +136,104 @@ async function loadSignatures(evalId, client) {
   return map;
 }
 
+async function loadEvalForPdf(id) {
+  const { rows } = await query('SELECT * FROM evaluations WHERE id = $1', [id]);
+  const ev = rows[0];
+  if (!ev) return null;
+
+  const sigs = await loadSignatures(id, null);
+  const { rows: names } = await query(
+    'SELECT id, name FROM users WHERE id = ANY($1)',
+    [[ev.employee_id, ev.supervisor_id].filter(Boolean)]
+  );
+  const nameOf = (uid) => names.find((u) => u.id === uid)?.name ?? '—';
+  return { ev, sigs, nameOf };
+}
+
+function drawEvaluationPdf(doc, { ev, sigs, nameOf }) {
+  doc.font('Helvetica-Bold').fontSize(18).text('Staff Performance Evaluation', { align: 'center' });
+  doc.moveDown();
+  doc.font('Helvetica').fontSize(11)
+    .text(`Employee: ${nameOf(ev.employee_id)}`)
+    .text(`Supervisor: ${nameOf(ev.supervisor_id)}`)
+    .text(`Period: ${ev.period}`)
+    .text(`Status: ${ev.status}`);
+
+  const sections = [
+    ['Goals', ev.goals],
+    ['Scores', ev.scores],
+    ['Comments', ev.comments],
+    ['Part H', ev.part_h],
+    ['Leader Review', ev.part_i?.comment],
+    ['Review Meeting', ev.review_meeting],
+  ];
+
+  for (const [title, value] of sections) {
+    if (value === undefined || value === null || value === '') {
+      continue;
+    }
+    if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) {
+      continue;
+    }
+    if (Array.isArray(value) && value.length === 0) {
+      continue;
+    }
+
+    doc.moveDown().font('Helvetica-Bold').fontSize(13).text(title);
+    doc.moveDown(0.3);
+    renderValue(doc, value);
+  }
+
+  doc.addPage();
+  doc.font('Helvetica-Bold').fontSize(14).text('Signatures');
+  doc.moveDown();
+
+  const slots = [
+    ['employee', 'Employee'],
+    ['supervisor', 'Supervisor'],
+    ['hr_officer', 'HR Officer'],
+    ['managing_partner', 'Executive'],
+  ];
+
+  for (const [slot, label] of slots) {
+    if (doc.y > 680) doc.addPage();
+    const sig = sigs[slot];
+    doc.font('Helvetica-Bold').fontSize(11).text(label, 50);
+    if (!sig) {
+      doc.font('Helvetica').fontSize(10).text('Not signed', 50);
+      doc.moveDown();
+      continue;
+    }
+
+    const y = doc.y;
+    if (sig.type === 'waived') {
+      doc.font('Helvetica-Oblique').fontSize(10).text(`Waived: ${sig.note ?? ''}`, 50);
+    } else if (sig.image) {
+      const buf = Buffer.from(sig.image.split(',')[1], 'base64');
+      doc.image(buf, 50, y, { fit: [180, 55] });
+      doc.y = y + 60;
+    }
+    doc.font('Helvetica').fontSize(10)
+      .text(`${sig.signer_name ?? 'Unknown'} · ${sig.signed_at ? new Date(sig.signed_at).toLocaleString() : 'Not dated'}`, 50);
+    if (sig.note) {
+      doc.font('Helvetica-Oblique').fontSize(9).text(sig.note, 50);
+    }
+    doc.moveDown();
+  }
+}
+
+function buildPdfBuffer(data) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+    drawEvaluationPdf(doc, data);
+    doc.end();
+  });
+}
+
 // ── GET /evaluations/mine ─────────────────────────────────────────────────
 router.get('/mine', requireAuth, async (req, res, next) => {
   try {
@@ -733,7 +831,7 @@ router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
 router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { password, image } = req.body ?? {};
+    const { password, image, comment = '', noComment = false } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
@@ -743,6 +841,9 @@ router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
     if (!password) return res.status(400).json({ error: 'password is required to sign.' });
     if (ev.status !== 'executive_review') {
       return res.status(422).json({ error: `Evaluation is not awaiting executive review (current: ${ev.status}).` });
+    }
+    if (!noComment && !String(comment).trim()) {
+      return res.status(400).json({ error: 'A leader comment is required unless "No further comment" is ticked.' });
     }
     if (!(await checkPassword(req.user.id, password))) {
       return res.status(401).json({ error: 'Password confirmation failed.' });
@@ -754,6 +855,14 @@ router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
     const img = await resolveSignatureImage(req.user.id, image);
     if (!img) return res.status(400).json({ error: 'No signature provided and none saved on your profile.' });
 
+    const partI = {
+      authorId: req.user.id,
+      authorName: req.user.name,
+      comment: noComment ? 'No further comment' : String(comment).trim(),
+      noComment,
+      submittedAt: new Date().toISOString(),
+    };
+
     await query(
       `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image)
        VALUES ($1, 'managing_partner', $2, $3, $4, 'signed', $5)`,
@@ -762,8 +871,8 @@ router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
 
     const newLog = appendAudit(ev.audit_log, req.user, 'EXECUTIVE_SIGNED', {});
     const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'signoff', audit_log = $1, updated_at = now() WHERE id = $2 RETURNING *`,
-      [JSON.stringify(newLog), id]
+      `UPDATE evaluations SET status = 'signoff', part_i = $1, audit_log = $2, updated_at = now() WHERE id = $3 RETURNING *`,
+      [JSON.stringify(partI), JSON.stringify(newLog), id]
     );
     res.json({ ...updated, signatures: await loadSignatures(id, null) });
   } catch (err) {
@@ -775,18 +884,35 @@ router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
 router.post('/:id/hr/approve', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const ev = await getEvalOrFail(res, id, null);
-    if (!ev) return;
-
-    if (req.user.role !== 'admin' && req.user.role !== 'hr_officer') {
+    if (!['admin', 'hr_officer'].includes(req.user.role)) {
       return res.status(403).json({ error: 'Forbidden: HR or admin only.' });
     }
 
-    const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'locked', updated_at = now() WHERE id = $1 RETURNING *`,
-      [id]
+    const data = await loadEvalForPdf(id);
+    if (!data) return res.status(404).json({ error: `Evaluation ${id} not found.` });
+    const { ev, sigs } = data;
+
+    if (ev.status !== 'hr_review') {
+      return res.status(422).json({ error: `Evaluation must be in hr_review (current: ${ev.status}).` });
+    }
+    if (!['employee', 'supervisor', 'hr_officer'].every((s) => sigs[s])) {
+      return res.status(422).json({ error: 'All three signatures are required before finalizing.' });
+    }
+
+    const pdf = await buildPdfBuffer(data);
+    await query(
+      `INSERT INTO evaluation_archives (evaluation_id, pdf, created_by)
+       VALUES ($1,$2,$3) ON CONFLICT (evaluation_id) DO NOTHING`,
+      [id, pdf, req.user.id]
     );
-    res.json(updated);
+
+    const newLog = appendAudit(ev.audit_log, req.user, 'EVALUATION_FINALIZED', {});
+    const { rows: [updated] } = await query(
+      `UPDATE evaluations SET status = 'locked', audit_log = $1, updated_at = now()
+       WHERE id = $2 RETURNING *`,
+      [JSON.stringify(newLog), id]
+    );
+    res.json({ ...updated, signatures: sigs });
   } catch (err) {
     next(err);
   }
@@ -1163,89 +1289,27 @@ router.post('/:id/sign', requireAuth, async (req, res, next) => {
 router.get('/:id/pdf', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const ev = await getEvalOrFail(res, id, null);
-    if (!ev) return;
+    const data = await loadEvalForPdf(id);
+    if (!data) return res.status(404).json({ error: `Evaluation ${id} not found.` });
+    const { ev, sigs } = data;
 
-    const canRead =
-      req.user.role === 'admin' ||
-      req.user.role === 'executive' ||
-      req.user.role === 'hr_officer' ||
-      ev.employee_id === req.user.id ||
-      ev.supervisor_id === req.user.id;
-    if (!canRead) return res.status(403).json({ error: 'Forbidden.' });
-
-    const sigs = await loadSignatures(id, null);
-    if (!sigs.managing_partner?.signed_at) {
-      return res.status(422).json({ error: 'The PDF is available after the executive has signed.' });
-    }
-
-    const { rows: names } = await query(
-      'SELECT id, name FROM users WHERE id = ANY($1)',
-      [[ev.employee_id, ev.supervisor_id].filter(Boolean)]
-    );
-    const nameOf = (uid) => names.find((u) => u.id === uid)?.name ?? '—';
+    const allowed =
+      ['admin', 'hr_officer', 'executive'].includes(req.user.role) ||
+      ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
+    if (!allowed) return res.status(403).json({ error: 'Forbidden.' });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="evaluation-${id.replace(/[^\w.-]/g, '_')}.pdf"`);
 
-    const doc = new PDFDocument({ margin: 50, size: 'A4' });
-    doc.pipe(res);
+    const { rows: arch } = await query('SELECT pdf FROM evaluation_archives WHERE evaluation_id = $1', [id]);
+    if (arch[0]) return res.send(arch[0].pdf);
 
-    doc.font('Helvetica-Bold').fontSize(18).text('Staff Performance Evaluation', { align: 'center' });
-    doc.moveDown();
-    doc.font('Helvetica').fontSize(11)
-      .text(`Employee: ${nameOf(ev.employee_id)}`)
-      .text(`Supervisor: ${nameOf(ev.supervisor_id)}`)
-      .text(`Period: ${ev.period}`)
-      .text(`Status: ${ev.status}`);
-
-    const sections = [
-      ['Goals', ev.goals],
-      ['Scores', ev.scores],
-      ['Comments', ev.comments],
-      ['Part H', ev.part_h],
-      ['Review Meeting', ev.review_meeting],
-    ];
-    for (const [title, value] of sections) {
-      if (!value || (typeof value === 'object' && Object.keys(value).length === 0)) continue;
-      doc.moveDown().font('Helvetica-Bold').fontSize(13).text(title);
-      doc.moveDown(0.3);
-      renderValue(doc, value);
+    if (!['employee', 'supervisor', 'hr_officer'].every((s) => sigs[s])) {
+      res.removeHeader('Content-Disposition');
+      return res.status(422).json({ error: 'The PDF is available once HR has signed.' });
     }
 
-    doc.addPage();
-    doc.font('Helvetica-Bold').fontSize(14).text('Signatures');
-    doc.moveDown();
-
-    const slots = [
-      ['employee', 'Employee'],
-      ['supervisor', 'Supervisor'],
-      ['managing_partner', 'Executive'],
-      ['hr_officer', 'HR Officer'],
-    ];
-    for (const [slot, label] of slots) {
-      if (doc.y > 680) doc.addPage();
-      const sig = sigs[slot];
-      doc.font('Helvetica-Bold').fontSize(11).text(label, 50);
-      if (!sig) {
-        doc.font('Helvetica').fontSize(10).text('Not signed', 50);
-        doc.moveDown();
-        continue;
-      }
-      const y = doc.y;
-      if (sig.type === 'waived') {
-        doc.font('Helvetica-Oblique').fontSize(10).text(`Waived: ${sig.note ?? ''}`, 50);
-      } else if (sig.image) {
-        const buf = Buffer.from(sig.image.split(',')[1], 'base64');
-        doc.image(buf, 50, y, { fit: [180, 55] });
-        doc.y = y + 60;
-      }
-      doc.font('Helvetica').fontSize(10)
-        .text(`${sig.signer_name} · ${new Date(sig.signed_at).toLocaleString()}`, 50);
-      doc.moveDown();
-    }
-
-    doc.end();
+    res.send(await buildPdfBuffer(data));
   } catch (err) {
     next(err);
   }
