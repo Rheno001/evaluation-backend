@@ -831,53 +831,43 @@ router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
 router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { password, image, comment = '', noComment = false } = req.body ?? {};
+    const { comment = '', noComment = false } = req.body ?? {};
+
+    if (!['admin', 'executive'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden: executive or admin only.' });
+    }
+
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
-    if (req.user.role !== 'admin' && req.user.role !== 'executive') {
-      return res.status(403).json({ error: 'Forbidden: executive or admin only.' });
-    }
-    if (!password) return res.status(400).json({ error: 'password is required to sign.' });
     if (ev.status !== 'executive_review') {
-      return res.status(422).json({ error: `Evaluation is not awaiting executive review (current: ${ev.status}).` });
+      return res.status(422).json({
+        error: `Evaluation is not awaiting executive review (current: ${ev.status}).`,
+      });
     }
     if (!noComment && !String(comment).trim()) {
-      return res.status(400).json({ error: 'A leader comment is required unless "No further comment" is ticked.' });
+      return res.status(400).json({
+        error: 'A leader comment is required unless "No further comment" is ticked.',
+      });
     }
-    if (!(await checkPassword(req.user.id, password))) {
-      return res.status(401).json({ error: 'Password confirmation failed.' });
-    }
-
-    const sigs = await loadSignatures(id, null);
-    if (sigs.managing_partner) return res.status(409).json({ error: 'Already signed by the executive.' });
-
-    const img = await resolveSignatureImage(req.user.id, image);
-    if (!img) return res.status(400).json({ error: 'No signature provided and none saved on your profile.' });
 
     const partI = {
       authorId: req.user.id,
       authorName: req.user.name,
       comment: noComment ? 'No further comment' : String(comment).trim(),
-      noComment,
+      noComment: !!noComment,
       submittedAt: new Date().toISOString(),
     };
+    const newLog = appendAudit(ev.audit_log, req.user, 'EXECUTIVE_APPROVED', { noComment: !!noComment });
 
-    await query(
-      `INSERT INTO signatures (evaluation_id, slot, signer_id, signer_name, signer_role, type, image)
-       VALUES ($1, 'managing_partner', $2, $3, $4, 'signed', $5)`,
-      [id, req.user.id, req.user.name, req.user.role, img]
-    );
-
-    const newLog = appendAudit(ev.audit_log, req.user, 'EXECUTIVE_SIGNED', {});
     const { rows: [updated] } = await query(
-      `UPDATE evaluations SET status = 'signoff', part_i = $1, audit_log = $2, updated_at = now() WHERE id = $3 RETURNING *`,
+      `UPDATE evaluations
+       SET status = 'signoff', part_i = $1, audit_log = $2, updated_at = now()
+       WHERE id = $3 RETURNING *`,
       [JSON.stringify(partI), JSON.stringify(newLog), id]
     );
-    res.json({ ...updated, signatures: await loadSignatures(id, null) });
-  } catch (err) {
-    next(err);
-  }
+    res.json(updated);
+  } catch (err) { next(err); }
 });
 
 // ── POST /evaluations/:id/hr/approve ──────────────────────────────────────
