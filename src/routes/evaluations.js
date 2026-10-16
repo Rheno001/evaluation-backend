@@ -1469,7 +1469,10 @@ router.get('/:id/pdf', requireAuth, async (req, res, next) => {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="evaluation-${id.replace(/[^\w.-]/g, '_')}.pdf"`);
     res.send(pdf);
-  } catch (err) { next(err); }
+  } catch (err) {
+    console.error('PDF route failed:', err);
+    next(err);
+  }
 });
 
 export default router;
