@@ -100,6 +100,30 @@ async function getEvalOrFail(res, id, client) {
   return rows[0];
 }
 
+async function loadSignatures(evaluationId, client = null) {
+  const result = client
+    ? await client.query(
+        'SELECT * FROM signatures WHERE evaluation_id = $1',
+        [evaluationId]
+      )
+    : await query(
+        'SELECT * FROM signatures WHERE evaluation_id = $1',
+        [evaluationId]
+      );
+
+  const signatures = {
+    employee: null,
+    supervisor: null,
+    hr_officer: null,
+  };
+
+  for (const signature of result.rows) {
+    signatures[signature.slot] = signature;
+  }
+
+  return signatures;
+}
+
 // ── PDF design ───────────────────────────────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOGO = (() => {
