@@ -124,6 +124,43 @@ async function loadSignatures(evaluationId, client = null) {
   return signatures;
 }
 
+async function loadEvalForPdf(id) {
+  const { rows } = await query(
+    'SELECT * FROM evaluations WHERE id = $1',
+    [id]
+  );
+
+  const ev = rows[0];
+
+  if (!ev) {
+    return null;
+  }
+
+  const sigs = await loadSignatures(id, null);
+
+  const userIds = [
+    ev.employee_id,
+    ev.supervisor_id,
+  ].filter(Boolean);
+
+  const { rows: users } = await query(
+    'SELECT id, name FROM users WHERE id = ANY($1)',
+    [userIds]
+  );
+
+  const nameOf = (userId) => {
+    if (!userId) return 'N/A';
+
+    const user = users.find(
+      (item) => String(item.id) === String(userId)
+    );
+
+    return user?.name ?? 'N/A';
+  };
+
+  return { ev, sigs, nameOf };
+}
+
 // ── PDF design ───────────────────────────────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOGO = (() => {
