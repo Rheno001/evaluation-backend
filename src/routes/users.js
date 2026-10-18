@@ -43,6 +43,39 @@ async function loadEvaluations(client) {
   return rows;
 }
 
+async function getDefaultSupervisorId() {
+  if (process.env.HR_ADMIN_ID) {
+    const { rows } = await query(
+      `SELECT id FROM users WHERE id = $1 AND active = true`,
+      [process.env.HR_ADMIN_ID]
+    );
+    if (rows[0]) return rows[0].id;
+  }
+
+  const { rows } = await query(
+    `SELECT id FROM users
+     WHERE role = 'admin' AND active = true
+     ORDER BY start_date ASC NULLS LAST, id ASC
+     LIMIT 1`
+  );
+  return rows[0]?.id ?? null;
+}
+
+async function wouldCreateCycle(userId, newSupervisorId) {
+  if (!newSupervisorId) return false;
+  if (newSupervisorId === userId) return true;
+  const { rows } = await query(
+    `WITH RECURSIVE chain AS (
+       SELECT id, supervisor_id FROM users WHERE id = $1
+       UNION
+       SELECT u.id, u.supervisor_id FROM users u JOIN chain c ON u.id = c.supervisor_id
+     )
+     SELECT 1 FROM chain WHERE id = $2 LIMIT 1`,
+    [newSupervisorId, userId]
+  );
+  return rows.length > 0;
+}
+
 // ── helper: increment token_version for a user (invalidates sessions) ────────
 async function bumpTokenVersion(client, userId) {
   await client.query(
@@ -92,19 +125,27 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res, next) => {
       return res.status(409).json({ error: `A user with email "${email}" already exists.` });
     }
 
+    let supId = supervisor_id && String(supervisor_id).trim() ? String(supervisor_id).trim() : null;
+    if (role === 'supervisor' && !supId) {
+      supId = await getDefaultSupervisorId();
+    }
+
     const initials = name.trim().split(/\s+/).map(w => w[0].toUpperCase()).slice(0, 2).join('');
     const id = `u-${Date.now()}`;
+    if (supId === id) {
+      return res.status(422).json({ error: 'That assignment would create a reporting loop.' });
+    }
     const hash = await bcrypt.hash(password, 10);
 
     const { rows } = await query(
       `INSERT INTO users (id, name, email, password_hash, raw_password, role, department, position, avatar_initials, supervisor_id, active, start_date)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, CURRENT_DATE)
        RETURNING id, name, email, role, department, position, avatar_initials, supervisor_id, active, start_date, created_at, raw_password`,
-      [id, name.trim(), email.toLowerCase().trim(), hash, password, role, department, position, initials, supervisor_id || null]
+      [id, name.trim(), email.toLowerCase().trim(), hash, password, role, department, position, initials, supId]
     );
 
     // Auto-create evaluation stubs for any open cycles
-    if (role === 'employee') {
+    if (role === 'employee' || role === 'supervisor' || supId) {
       try {
         const { rows: openCycles } = await query("SELECT * FROM cycles WHERE status != 'locked'");
         for (const cy of openCycles) {
@@ -114,11 +155,11 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res, next) => {
                (id, employee_id, supervisor_id, period, status, attendance, goals, scores, comments, part_h, review_meeting)
              VALUES ($1, $2, $3, $4, 'draft', '[]', '[]', '{}', '{}', '{}', '{}')
              ON CONFLICT (id) DO NOTHING`,
-            [evalId, id, supervisor_id || null, cy.period]
+            [evalId, id, supId, cy.period]
           );
         }
       } catch (e) {
-        console.warn('Failed to auto-create evaluation stubs for new employee:', e);
+        console.warn('Failed to auto-create evaluation stubs for new evaluated user:', e);
       }
     }
 
@@ -234,6 +275,21 @@ router.patch('/:id', requireAuth, requireRole('admin'), async (req, res, next) =
       if (!check.allowed) {
         await client.query('ROLLBACK');
         return res.status(422).json({ error: check.reason });
+      }
+    }
+
+    const { rows: [current] } = await client.query('SELECT role, supervisor_id FROM users WHERE id = $1', [id]);
+    const becomingSupervisor = patch.role === 'supervisor' && current?.role !== 'supervisor';
+    const noSupervisorGiven = patch.supervisor_id === undefined;
+    if (becomingSupervisor && !current?.supervisor_id && noSupervisorGiven) {
+      patch.supervisor_id = await getDefaultSupervisorId();
+    }
+
+    if (patch.supervisor_id !== undefined) {
+      const loop = await wouldCreateCycle(id, patch.supervisor_id || null);
+      if (loop) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ error: 'That assignment would create a reporting loop.' });
       }
     }
 

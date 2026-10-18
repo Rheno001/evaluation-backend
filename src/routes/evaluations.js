@@ -25,8 +25,27 @@ const SELF_EDITABLE = ['draft', 'goals_set', 'self_assessment'];
 const SIG_DATA_URL = /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/;
 const MAX_SIG_CHARS = 400_000;
 const ALL_SLOTS = ['employee', 'supervisor', 'hr_officer'];
+const HR_ROLES = ['admin', 'hr_officer'];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+function blockOwnEvaluation(ev, user, res, action) {
+  if (ev.employee_id === user.id) {
+    res.status(403).json({ error: `You cannot ${action} your own evaluation.` });
+    return true;
+  }
+  return false;
+}
+
+async function canActAsHr(user, ev) {
+  if (ev.employee_id === user.id) return false;
+  if (HR_ROLES.includes(user.role)) return true;
+  if (user.role === 'executive') {
+    const { rows: [emp] } = await query('SELECT role FROM users WHERE id = $1', [ev.employee_id]);
+    return HR_ROLES.includes(emp?.role);
+  }
+  return false;
+}
 
 function appendAudit(existingLog, actor, action, details = {}) {
   const entry = {
@@ -504,7 +523,10 @@ router.get('/mine', requireAuth, async (req, res, next) => {
       [req.user.id]
     );
 
-    if (!rows[0]) {
+    const { rows: me } = await query('SELECT role, supervisor_id FROM users WHERE id = $1', [req.user.id]);
+    const evaluated = me[0]?.role === 'employee' || !!me[0]?.supervisor_id;
+
+    if (!rows[0] && evaluated) {
       // Auto-heal: if an open cycle exists, create evaluation stub
       const { rows: cycles } = await query(
         `SELECT * FROM cycles WHERE status != 'locked' ORDER BY opened_at DESC LIMIT 1`
@@ -675,12 +697,11 @@ router.post('/:id/signoff-signature', requireAuth, async (req, res, next) => {
     const { password, image } = req.body ?? {};
     if (!password) return res.status(400).json({ error: 'password is required.' });
 
-    if (!['admin', 'hr_officer'].includes(req.user.role)) {
-      return res.status(403).json({ error: 'Only HR can sign the HR Officer slot.' });
-    }
-
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (!(await canActAsHr(req.user, ev))) {
+      return res.status(403).json({ error: 'You cannot sign or finalize this evaluation.' });
+    }
     if (ev.status !== 'signoff') {
       return res.status(422).json({ error: `Sign-off is not open (current: ${ev.status}).` });
     }
@@ -832,6 +853,7 @@ router.post('/:id/goals/approve', requireAuth, async (req, res, next) => {
     const { id } = req.params;
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'approve goals for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may approve goals.' });
@@ -857,6 +879,7 @@ router.post('/:id/goals/reject', requireAuth, async (req, res, next) => {
     const { note } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'reject goals for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may reject goals.' });
@@ -990,6 +1013,7 @@ router.patch('/:id/supervisor', requireAuth, async (req, res, next) => {
     const { scores, comments } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'evaluate')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden.' });
@@ -1027,6 +1051,7 @@ router.post('/:id/supervisor/submit', requireAuth, async (req, res, next) => {
     const { id } = req.params;
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'submit the evaluation for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden.' });
@@ -1049,6 +1074,7 @@ router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
     const { scores, goals, partH, reviewMeeting } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'agree on the evaluation for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden.' });
@@ -1107,6 +1133,7 @@ router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
     const { id } = req.params;
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'submit the evaluation for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden.' });
@@ -1143,6 +1170,7 @@ router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
 
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'approve the evaluation for')) return;
 
     if (ev.status !== 'executive_review') {
       return res.status(422).json({
@@ -1178,13 +1206,13 @@ router.post('/:id/executive/approve', requireAuth, async (req, res, next) => {
 router.post('/:id/hr/approve', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
-    if (!['admin', 'hr_officer'].includes(req.user.role)) {
-      return res.status(403).json({ error: 'Forbidden: HR or admin only.' });
-    }
 
     const data = await loadEvalForPdf(id);
     if (!data) return res.status(404).json({ error: `Evaluation ${id} not found.` });
     const { ev, sigs } = data;
+    if (!(await canActAsHr(req.user, ev))) {
+      return res.status(403).json({ error: 'You cannot sign or finalize this evaluation.' });
+    }
 
     if (ev.status !== 'hr_review') {
       return res.status(422).json({ error: `Evaluation must be in hr_review (current: ${ev.status}).` });
@@ -1316,6 +1344,7 @@ router.post('/:id/open-self-assessment', requireAuth, requireRole('admin'), asyn
     const { id } = req.params;
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'open self-assessment for')) return;
 
     if (!['draft', 'goals_set'].includes(ev.status)) {
       return res.status(422).json({
@@ -1346,6 +1375,7 @@ router.post('/:id/waive-self-assessment', requireAuth, requireRole('admin'), asy
 
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'waive self-assessment for')) return;
 
     if (ev.status !== 'self_assessment') {
       return res.status(422).json({
@@ -1405,6 +1435,7 @@ router.post('/:id/goals-on-behalf', requireAuth, requireRole('admin'), async (re
 
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'save goals for')) return;
 
     // App-layer departure check (DB trigger also enforces)
     if (!ev.departure) {
@@ -1447,6 +1478,7 @@ router.post('/:id/waive-employee-sig', requireAuth, requireRole('admin'), async 
 
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (blockOwnEvaluation(ev, req.user, res, 'waive the employee signature for')) return;
 
     if (ev.status !== 'signoff') {
       return res.status(422).json({

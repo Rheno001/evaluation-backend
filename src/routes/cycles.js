@@ -88,9 +88,9 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res, next) => {
       [cycleId, period.trim(), starts_on, ends_on]
     );
 
-    // Create evaluation stubs for all active employees
+    // Create evaluation stubs for all active evaluated users
     const { rows: employees } = await query(
-      `SELECT * FROM users WHERE role = 'employee' AND active = true`
+      `SELECT * FROM users WHERE active = true AND (role = 'employee' OR supervisor_id IS NOT NULL)`
     );
     const { rows: existingEvals } = await query(
       `SELECT employee_id FROM evaluations WHERE period = $1`,
