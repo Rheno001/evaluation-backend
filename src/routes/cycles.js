@@ -137,11 +137,12 @@ router.post('/:period/open-self-assessment', requireAuth, requireRole('admin'), 
       return res.status(404).json({ error: `Quarter "${period}" not found.` });
     }
 
-    // Move ALL non-locked evaluations in this period to self_assessment
-    // (covers draft, goals_submitted, and goals_set — those still in goal workflow will be skipped)
+    // Move only people whose goals are already approved into self_assessment.
+    // Employees still in goal setting stay in place until they advance normally.
     const { rowCount } = await query(
-      `UPDATE evaluations SET status = 'self_assessment', updated_at = now()
-       WHERE period = $1 AND status IN ('draft', 'goals_submitted', 'goals_set')`,
+      `UPDATE evaluations
+       SET status = 'self_assessment', updated_at = now()
+       WHERE period = $1 AND status = 'goals_set'`,
       [period]
     );
 

@@ -27,6 +27,11 @@ const MAX_SIG_CHARS = 400_000;
 const ALL_SLOTS = ['employee', 'supervisor', 'hr_officer'];
 const HR_ROLES = ['admin', 'hr_officer'];
 
+async function statusAfterGoalsApproved(period) {
+  const { rows } = await query('SELECT status FROM cycles WHERE period = $1', [period]);
+  return rows[0]?.status === 'self_assessment' ? 'self_assessment' : 'goals_set';
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function blockOwnEvaluation(ev, user, res, action) {
@@ -811,6 +816,9 @@ router.patch('/:id/goals', requireAuth, async (req, res, next) => {
     }
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (ev.status !== 'draft') {
+      return res.status(422).json({ error: `Goals can only be changed while in goal setting (current: ${ev.status}).` });
+    }
 
     if (ev.employee_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden: you can only edit your own goals.' });
@@ -832,6 +840,9 @@ router.post('/:id/goals/submit', requireAuth, async (req, res, next) => {
     const { id } = req.params;
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (ev.status !== 'draft') {
+      return res.status(422).json({ error: `Goals can only be changed while in goal setting (current: ${ev.status}).` });
+    }
 
     if (ev.employee_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden: you can only submit your own goals.' });
@@ -853,14 +864,16 @@ router.post('/:id/goals/approve', requireAuth, async (req, res, next) => {
     const { id } = req.params;
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (ev.status !== 'goals_submitted') {
+      return res.status(422).json({ error: `These goals are not awaiting approval (current: ${ev.status}).` });
+    }
     if (blockOwnEvaluation(ev, req.user, res, 'approve goals for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may approve goals.' });
     }
 
-    const { rows: cycleRows } = await query(`SELECT status FROM cycles WHERE period = $1`, [ev.period]);
-    const nextStatus = cycleRows[0]?.status === 'self_assessment' ? 'self_assessment' : 'goals_set';
+    const nextStatus = await statusAfterGoalsApproved(ev.period);
 
     const { rows: [updated] } = await query(
       `UPDATE evaluations SET status = $1, goals_rejection_note = NULL, updated_at = now() WHERE id = $2 RETURNING *`,
@@ -879,6 +892,9 @@ router.post('/:id/goals/reject', requireAuth, async (req, res, next) => {
     const { note } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+    if (ev.status !== 'goals_submitted') {
+      return res.status(422).json({ error: `These goals are not awaiting approval (current: ${ev.status}).` });
+    }
     if (blockOwnEvaluation(ev, req.user, res, 'reject goals for')) return;
 
     if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
@@ -1455,11 +1471,12 @@ router.post('/:id/goals-on-behalf', requireAuth, requireRole('admin'), async (re
     const taggedGoals = goals.map((g) => ({ ...g, entered_on_behalf: true }));
 
     const newLog = appendAudit(ev.audit_log, req.user, 'GOALS_SAVED_ON_BEHALF', {});
+    const nextStatus = await statusAfterGoalsApproved(ev.period);
     const { rows: [updated] } = await query(
       `UPDATE evaluations
-       SET goals = $1, status = 'goals_set', audit_log = $2, updated_at = now()
-       WHERE id = $3 RETURNING *`,
-      [JSON.stringify(taggedGoals), JSON.stringify(newLog), id]
+       SET goals = $1, status = $2, audit_log = $3, updated_at = now()
+       WHERE id = $4 RETURNING *`,
+      [JSON.stringify(taggedGoals), nextStatus, JSON.stringify(newLog), id]
     );
     res.json(updated);
   } catch (err) {
