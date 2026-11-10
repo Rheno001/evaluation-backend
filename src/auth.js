@@ -13,12 +13,18 @@ const EXPIRES_IN = '15m';
  * Sign a JWT for the given user row.
  * Payload stores token_version so the server can invalidate old tokens.
  *
- * @param {{ id: string, name: string, role: string, token_version: number }} user
+ * @param {{ id: string, name: string, role: string, token_version: number, supervisor_id?: string | null }} user
  * @returns {string}
  */
 export function signToken(user) {
   return jwt.sign(
-    { id: user.id, name: user.name, role: user.role, tv: user.token_version },
+    {
+      id: user.id,
+      name: user.name,
+      role: user.role,
+      supervisor_id: user.supervisor_id ?? null,
+      tv: user.token_version,
+    },
     SECRET,
     { expiresIn: EXPIRES_IN }
   );
@@ -46,7 +52,7 @@ export async function requireAuth(req, res, next) {
   // Check token_version against DB to catch invalidated sessions
   try {
     const { rows } = await query(
-      'SELECT id, name, role, active, token_version FROM users WHERE id = $1',
+      'SELECT id, name, role, supervisor_id, active, token_version FROM users WHERE id = $1',
       [payload.id]
     );
     const dbUser = rows[0];
@@ -63,7 +69,12 @@ export async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Session expired. Please sign in again.' });
     }
 
-    req.user = { id: dbUser.id, name: dbUser.name, role: dbUser.role };
+    req.user = {
+      id: dbUser.id,
+      name: dbUser.name,
+      role: dbUser.role,
+      supervisorId: dbUser.supervisor_id ?? null,
+    };
     next();
   } catch (err) {
     next(err);

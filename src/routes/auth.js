@@ -36,7 +36,14 @@ router.post('/login', async (req, res, next) => {
 
     const token = signToken(user);
     const { password_hash: _, token_version: __, ...safeUser } = user;
-    return res.json({ token, user: safeUser });
+    return res.json({
+      token,
+      user: {
+        ...safeUser,
+        supervisorId: safeUser.supervisor_id ?? null,
+        supervisor_name: user.supervisor_id ? await query('SELECT name FROM users WHERE id = $1', [user.supervisor_id]).then(r => r.rows[0]?.name ?? null) : null,
+      },
+    });
   } catch (err) {
     next(err);
   }
