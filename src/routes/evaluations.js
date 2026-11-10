@@ -18,7 +18,13 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { requireAuth, requireRole } from '../auth.js';
 import { query, getClient } from '../db.js';
-import { canReassign, canSign, departureWaivers } from '../lib/rules.js';
+import {
+  canReassign,
+  canSign,
+  canViewUser,
+  departureWaivers,
+  getVisibleUserIds,
+} from '../lib/rules.js';
 
 const router = Router();
 const SELF_EDITABLE = ['draft', 'goals_set', 'self_assessment'];
@@ -583,6 +589,9 @@ router.get('/', requireAuth, async (req, res, next) => {
          ORDER BY e.updated_at DESC`
       ));
     } else {
+      const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
+      const visibleIds = getVisibleUserIds(allUsers, req.user.id);
+
       // Auto-sync: keep open evaluations supervisor_id aligned with current users.supervisor_id
       await query(
         `UPDATE evaluations e
@@ -600,9 +609,10 @@ router.get('/', requireAuth, async (req, res, next) => {
          FROM evaluations e
          LEFT JOIN users eu ON eu.id = e.employee_id
          LEFT JOIN users su ON su.id = e.supervisor_id
-         WHERE e.supervisor_id = $1 OR e.employee_id = $1
+         WHERE e.employee_id = ANY($1)
+            OR e.supervisor_id = ANY($1)
          ORDER BY e.updated_at DESC`,
-        [req.user.id]
+        [visibleIds]
       ));
     }
     res.json(rows);
@@ -747,10 +757,12 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
+    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
     const canRead =
       req.user.role === 'admin' ||
       ev.employee_id === req.user.id ||
-      ev.supervisor_id === req.user.id;
+      ev.supervisor_id === req.user.id ||
+      canViewUser(req.user, { id: ev.employee_id }, allUsers);
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this evaluation.' });
     }
@@ -767,10 +779,12 @@ router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
 
+    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
     const canRead =
       req.user.role === 'admin' ||
       ev.employee_id === req.user.id ||
-      ev.supervisor_id === req.user.id;
+      ev.supervisor_id === req.user.id ||
+      canViewUser(req.user, { id: ev.employee_id }, allUsers);
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this self-assessment.' });
     }

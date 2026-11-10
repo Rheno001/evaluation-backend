@@ -16,6 +16,8 @@ import {
   canDeactivate,
   canChangeRole,
   canReassign,
+  canViewUser,
+  getVisibleUserIds,
   supervisorPendingWork,
   directReports,
   setupWarnings,
@@ -101,6 +103,27 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res, next) => {
   }
 });
 
+router.get('/team', requireAuth, async (req, res, next) => {
+  try {
+    const { rows: allUsers } = await query(
+      `SELECT id, name, email, role, department, position,
+              avatar_initials, supervisor_id, active, start_date, created_at,
+              raw_password
+       FROM users ORDER BY name`
+    );
+
+    if (req.user.role === 'admin') {
+      return res.json(allUsers);
+    }
+
+    const visibleIds = getVisibleUserIds(allUsers, req.user.id);
+    const team = allUsers.filter((user) => visibleIds.includes(user.id));
+    res.json(team);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── POST /users  (admin creates staff account) ──────────────────────────────
 const CreateUserSchema = z.object({
   name:          z.string().min(1),
@@ -173,9 +196,17 @@ router.post('/', requireAuth, requireRole('admin'), async (req, res, next) => {
 router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params;
+
     if (req.user.role !== 'admin' && req.user.id !== id) {
-      return res.status(403).json({ error: 'Forbidden: you may only view your own profile.' });
+      const { rows: allUsers } = await query(
+        `SELECT id, supervisor_id, active FROM users`
+      );
+      const allowed = canViewUser(req.user, { id }, allUsers);
+      if (!allowed) {
+        return res.status(403).json({ error: 'Forbidden: you may only view your own profile or your team members.' });
+      }
     }
+
     const { rows } = await query(
       `SELECT id, name, email, role, department, position,
               avatar_initials, supervisor_id, active, start_date, created_at,
