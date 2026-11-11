@@ -757,12 +757,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
-    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
-    const canRead =
-      req.user.role === 'admin' ||
-      ev.employee_id === req.user.id ||
-      ev.supervisor_id === req.user.id ||
-      canViewUser(req.user, { id: ev.employee_id }, allUsers);
+    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this evaluation.' });
     }
@@ -779,12 +774,7 @@ router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
 
-    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
-    const canRead =
-      req.user.role === 'admin' ||
-      ev.employee_id === req.user.id ||
-      ev.supervisor_id === req.user.id ||
-      canViewUser(req.user, { id: ev.employee_id }, allUsers);
+    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this self-assessment.' });
     }
@@ -883,7 +873,7 @@ router.post('/:id/goals/approve', requireAuth, async (req, res, next) => {
     }
     if (blockOwnEvaluation(ev, req.user, res, 'approve goals for')) return;
 
-    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+    if (ev.supervisor_id !== req.user.id) {
       return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may approve goals.' });
     }
 
@@ -911,7 +901,7 @@ router.post('/:id/goals/reject', requireAuth, async (req, res, next) => {
     }
     if (blockOwnEvaluation(ev, req.user, res, 'reject goals for')) return;
 
-    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
+    if (ev.supervisor_id !== req.user.id) {
       return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may reject goals.' });
     }
 
@@ -1045,8 +1035,8 @@ router.patch('/:id/supervisor', requireAuth, async (req, res, next) => {
     if (!ev) return;
     if (blockOwnEvaluation(ev, req.user, res, 'evaluate')) return;
 
-    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
+    if (ev.supervisor_id !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may act on this evaluation.' });
     }
 
     const setClauses = [];
@@ -1083,8 +1073,8 @@ router.post('/:id/supervisor/submit', requireAuth, async (req, res, next) => {
     if (!ev) return;
     if (blockOwnEvaluation(ev, req.user, res, 'submit the evaluation for')) return;
 
-    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
+    if (ev.supervisor_id !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may act on this evaluation.' });
     }
 
     const { rows: [updated] } = await query(
@@ -1106,8 +1096,8 @@ router.patch('/:id/agreed', requireAuth, async (req, res, next) => {
     if (!ev) return;
     if (blockOwnEvaluation(ev, req.user, res, 'agree on the evaluation for')) return;
 
-    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
+    if (ev.supervisor_id !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may act on this evaluation.' });
     }
 
     if (['executive_review', 'signoff', 'hr_review', 'locked'].includes(ev.status)) {
@@ -1165,8 +1155,8 @@ router.post('/:id/agreed/confirm', requireAuth, async (req, res, next) => {
     if (!ev) return;
     if (blockOwnEvaluation(ev, req.user, res, 'submit the evaluation for')) return;
 
-    if (ev.supervisor_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
+    if (ev.supervisor_id !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden: only the assigned supervisor may act on this evaluation.' });
     }
     if (ev.status !== 'review_meeting') {
       return res.status(422).json({ error: `Cannot submit from status ${ev.status}.` });

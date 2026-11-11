@@ -271,29 +271,9 @@ function getSupervisorId(user = {}) {
 export function getVisibleUserIds(users = [], userId = '') {
   if (!userId) return [];
 
-  const childrenBySupervisor = new Map();
-  for (const user of users) {
-    const parentId = getSupervisorId(user);
-    if (!parentId || user.id === parentId) continue;
-    const children = childrenBySupervisor.get(parentId) ?? [];
-    children.push(user.id);
-    childrenBySupervisor.set(parentId, children);
-  }
-
-  const visible = new Set([userId]);
-  const stack = [userId];
-
-  while (stack.length > 0) {
-    const currentId = stack.pop();
-    for (const childId of childrenBySupervisor.get(currentId) ?? []) {
-      if (!visible.has(childId)) {
-        visible.add(childId);
-        stack.push(childId);
-      }
-    }
-  }
-
-  return [...visible];
+  return (users || [])
+    .filter((user) => user?.id && user?.active !== false && (user?.supervisorId ?? user?.supervisor_id) === userId)
+    .map((user) => user.id);
 }
 
 export function canViewUser(actor, target, users = []) {
@@ -301,7 +281,10 @@ export function canViewUser(actor, target, users = []) {
 
   const targetId = typeof target === 'string' ? target : target.id;
   if (!targetId) return false;
-  if (actor.id === targetId || actor.role === 'admin') return true;
+  if (actor.id === targetId) return true;
+  if (actor.role === 'admin' || actor.role === 'executive' || actor.role === 'super_admin') {
+    return false;
+  }
   if (actor.role !== 'supervisor') return false;
 
   return getVisibleUserIds(users, actor.id).includes(targetId);
