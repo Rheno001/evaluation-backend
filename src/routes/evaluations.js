@@ -576,46 +576,83 @@ router.get('/mine', requireAuth, async (req, res, next) => {
   }
 });
 
-// ── GET /evaluations  (team / admin) ────────────────────────────────────────
+// ── GET /evaluations  (personal operational scope by default; explicit oversight only when authorized) ────────────────────────────────────────
 router.get('/', requireAuth, async (req, res, next) => {
   try {
-    let rows;
-    if (req.user.role === 'admin') {
-      ({ rows } = await query(
+    const scope = String(req.query.scope || 'my_team').toLowerCase();
+    const allowedScopes = new Set(['my_team', 'all', 'executive_review']);
+    if (!allowedScopes.has(scope)) {
+      return res.status(400).json({ error: 'Unsupported scope. Use my_team or all.' });
+    }
+
+    const isExplicitOversight = scope === 'all' || scope === 'executive_review';
+    const hasOversightPermission =
+      req.user.role === 'super_admin' ||
+      req.user.role === 'executive' ||
+      req.user.role === 'hr_officer' ||
+      req.user.role === 'admin' && (req.user.globalOversight === true || req.user.global_oversight === true || req.user.isGlobalObserver === true);
+
+    if (isExplicitOversight && !hasOversightPermission) {
+      return res.status(403).json({ error: 'Forbidden: this scope is reserved for explicit oversight access.' });
+    }
+
+    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
+    const directTeamIds = allUsers
+      .filter((user) => user.active !== false && (user.supervisor_id === req.user.id || user.id === req.user.id))
+      .map((user) => user.id);
+
+    if (scope === 'all') {
+      const { rows } = await query(
         `SELECT e.*, eu.name AS employee_name, su.name AS supervisor_name
          FROM evaluations e
          LEFT JOIN users eu ON eu.id = e.employee_id
          LEFT JOIN users su ON su.id = e.supervisor_id
          ORDER BY e.updated_at DESC`
-      ));
-    } else {
-      const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
-      const visibleIds = getVisibleUserIds(allUsers, req.user.id);
-
-      // Auto-sync: keep open evaluations supervisor_id aligned with current users.supervisor_id
-      await query(
-        `UPDATE evaluations e
-         SET supervisor_id = u.supervisor_id
-         FROM users u
-         WHERE e.employee_id = u.id
-           AND u.supervisor_id = $1
-           AND (e.supervisor_id IS DISTINCT FROM $1)
-           AND e.status != 'locked'`,
-        [req.user.id]
       );
-
-      ({ rows } = await query(
-        `SELECT e.*, eu.name AS employee_name, su.name AS supervisor_name
-         FROM evaluations e
-         LEFT JOIN users eu ON eu.id = e.employee_id
-         LEFT JOIN users su ON su.id = e.supervisor_id
-         WHERE e.employee_id = ANY($1)
-            OR e.supervisor_id = ANY($1)
-         ORDER BY e.updated_at DESC`,
-        [visibleIds]
-      ));
+      return res.json({
+        data: rows,
+        meta: {
+          scope,
+          viewer_context: 'administrative_observer',
+          is_direct_supervisor: false,
+          is_administrative_observer: true,
+          total: rows.length,
+        },
+      });
     }
-    res.json(rows);
+
+    await query(
+      `UPDATE evaluations e
+       SET supervisor_id = u.supervisor_id
+       FROM users u
+       WHERE e.employee_id = u.id
+         AND u.supervisor_id = $1
+         AND (e.supervisor_id IS DISTINCT FROM $1)
+         AND e.status != 'locked'`,
+      [req.user.id]
+    );
+
+    const { rows } = await query(
+      `SELECT e.*, eu.name AS employee_name, su.name AS supervisor_name
+       FROM evaluations e
+       LEFT JOIN users eu ON eu.id = e.employee_id
+       LEFT JOIN users su ON su.id = e.supervisor_id
+       WHERE e.employee_id = ANY($1)
+          OR e.supervisor_id = $2
+       ORDER BY e.updated_at DESC`,
+      [directTeamIds, req.user.id]
+    );
+
+    res.json({
+      data: rows,
+      meta: {
+        scope: 'my_team',
+        viewer_context: 'operational_actor',
+        is_direct_supervisor: true,
+        is_administrative_observer: false,
+        total: rows.length,
+      },
+    });
   } catch (err) {
     next(err);
   }

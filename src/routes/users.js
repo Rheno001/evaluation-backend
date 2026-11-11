@@ -112,12 +112,11 @@ router.get('/team', requireAuth, async (req, res, next) => {
        FROM users ORDER BY name`
     );
 
-    if (req.user.role === 'admin') {
-      return res.json(allUsers);
-    }
+    const team = allUsers.filter((user) => {
+      if (user.id === req.user.id) return true;
+      return user.supervisor_id === req.user.id;
+    });
 
-    const visibleIds = getVisibleUserIds(allUsers, req.user.id);
-    const team = allUsers.filter((user) => visibleIds.includes(user.id));
     res.json(team);
   } catch (err) {
     next(err);
