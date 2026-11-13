@@ -290,6 +290,36 @@ export function canViewUser(actor, target, users = []) {
   return getVisibleUserIds(users, actor.id).includes(targetId);
 }
 
+export function canViewEvaluation(evaluation = {}, viewer = {}) {
+  if (!evaluation || !viewer) return false;
+
+  const employeeId = evaluation.employeeId ?? evaluation.employee_id ?? null;
+  const supervisorId = evaluation.supervisorId ?? evaluation.supervisor_id ?? null;
+
+  if (!employeeId && !supervisorId) return false;
+  if (viewer.id === employeeId) return true;
+  if (viewer.id === supervisorId) return true;
+
+  const adminRoles = new Set(['admin', 'super_admin', 'hr_officer']);
+  if (adminRoles.has(viewer.role)) return true;
+
+  return false;
+}
+
+export function canViewSelfAssessment(evaluation = {}, viewer = {}) {
+  if (!evaluation || !viewer) return false;
+
+  if (['draft', 'goals_set'].includes(evaluation.status)) return false;
+
+  if (viewer.id === (evaluation.employeeId ?? evaluation.employee_id)) return true;
+  if (viewer.id === (evaluation.supervisorId ?? evaluation.supervisor_id)) return true;
+
+  const adminRoles = new Set(['admin', 'super_admin', 'hr_officer']);
+  if (adminRoles.has(viewer.role)) return true;
+
+  return false;
+}
+
 /**
  * Checks if a target user can be deactivated.
  *

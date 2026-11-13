@@ -21,6 +21,8 @@ import { query, getClient } from '../db.js';
 import {
   canReassign,
   canSign,
+  canViewEvaluation,
+  canViewSelfAssessment,
   canViewUser,
   departureWaivers,
   getVisibleUserIds,
@@ -757,7 +759,7 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
-    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
+    const canRead = canViewEvaluation(ev, req.user);
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this evaluation.' });
     }
@@ -774,7 +776,7 @@ router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
 
-    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
+    const canRead = canViewSelfAssessment(ev, req.user);
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this self-assessment.' });
     }
@@ -1268,9 +1270,18 @@ router.patch('/:id/attendance', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
+    const canManage = canViewEvaluation(ev, req.user) || req.user.role === 'admin';
+    if (!canManage) {
+      return res.status(403).json({ error: 'Forbidden: you do not have permission to edit this evaluation.' });
+    }
+
+    if (!Array.isArray(attendance)) {
+      return res.status(400).json({ error: 'attendance must be an array.' });
+    }
+
     const { rows: [updated] } = await query(
       `UPDATE evaluations SET attendance = $1, updated_at = now() WHERE id = $2 RETURNING *`,
-      [JSON.stringify(attendance || []), id]
+      [JSON.stringify(attendance), id]
     );
     res.json(updated);
   } catch (err) {
@@ -1286,9 +1297,18 @@ router.patch('/:id/incidents', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
+    const canManage = canViewEvaluation(ev, req.user) || req.user.role === 'admin';
+    if (!canManage) {
+      return res.status(403).json({ error: 'Forbidden: you do not have permission to edit this evaluation.' });
+    }
+
+    if (!Array.isArray(incidents)) {
+      return res.status(400).json({ error: 'incidents must be an array.' });
+    }
+
     const { rows: [updated] } = await query(
       `UPDATE evaluations SET incidents = $1, updated_at = now() WHERE id = $2 RETURNING *`,
-      [JSON.stringify(incidents || []), id]
+      [JSON.stringify(incidents), id]
     );
     res.json(updated);
   } catch (err) {

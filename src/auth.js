@@ -7,7 +7,7 @@ import jwt from 'jsonwebtoken';
 import { query } from './db.js';
 
 const SECRET = process.env.JWT_SECRET || 'insecure-dev-secret';
-const EXPIRES_IN = '15m';
+const EXPIRES_IN = '1h';
 
 /**
  * Sign a JWT for the given user row.
