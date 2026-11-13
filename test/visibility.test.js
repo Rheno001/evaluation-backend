@@ -38,7 +38,7 @@ test('directReports accepts DB snake_case keys', () => {
   assert.deepEqual(directReports(users, 'mgr-1').map((u) => u.id).sort(), ['u-1', 'u-2'].sort());
 });
 
-test('admin can review submitted self-assessments while draft data remains guarded', () => {
+test('oversight roles cannot read pre-leadership review content, but can read once the evaluation reaches executive review', () => {
   const ev = {
     id: 'ev-1',
     employee_id: 'e-1',
@@ -46,13 +46,23 @@ test('admin can review submitted self-assessments while draft data remains guard
     status: 'self_assessment',
   };
 
-  assert.equal(canViewEvaluation(ev, { id: 'admin', role: 'admin' }), true);
+  assert.equal(canViewEvaluation(ev, { id: 'admin', role: 'admin' }), false);
   assert.equal(canViewEvaluation(ev, { id: 's-1', role: 'supervisor' }), true);
   assert.equal(canViewEvaluation(ev, { id: 'e-1', role: 'employee' }), true);
   assert.equal(canViewEvaluation(ev, { id: 'other', role: 'supervisor' }), false);
 
-  assert.equal(canViewSelfAssessment(ev, { id: 'admin', role: 'admin' }), true);
-  assert.equal(canViewSelfAssessment({ ...ev, status: 'draft' }, { id: 'admin', role: 'admin' }), false);
+  assert.equal(canViewSelfAssessment(ev, { id: 'admin', role: 'admin' }), false);
+  assert.equal(canViewSelfAssessment({ ...ev, status: 'executive_review' }, { id: 'admin', role: 'admin' }), true);
+});
+
+test('oversight roles only view evaluations from executive_review onward, even when not the assigned supervisor', () => {
+  const early = { id: 'ev-2', employee_id: 'e-2', supervisor_id: 's-2', status: 'self_assessment' };
+  const late = { ...early, status: 'executive_review' };
+
+  assert.equal(canViewEvaluation(early, { id: 'leader-1', role: 'executive' }), false);
+  assert.equal(canViewEvaluation(late, { id: 'leader-1', role: 'executive' }), true);
+  assert.equal(canViewSelfAssessment(early, { id: 'leader-1', role: 'executive' }), false);
+  assert.equal(canViewSelfAssessment(late, { id: 'leader-1', role: 'executive' }), true);
 });
 
 test('auth tokens last one hour and expire correctly', () => {

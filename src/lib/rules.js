@@ -290,6 +290,27 @@ export function canViewUser(actor, target, users = []) {
   return getVisibleUserIds(users, actor.id).includes(targetId);
 }
 
+function statusReached(status, minimum) {
+  const statusOrder = [
+    'draft',
+    'goals_submitted',
+    'goals_set',
+    'self_assessment',
+    'supervisor_assessment',
+    'review_meeting',
+    'executive_review',
+    'signoff',
+    'hr_review',
+    'locked',
+    'completed',
+  ];
+  const normalizedStatus = String(status ?? '').trim().toLowerCase();
+  const currentIndex = statusOrder.indexOf(normalizedStatus);
+  const minimumIndex = statusOrder.indexOf(String(minimum).trim().toLowerCase());
+  if (currentIndex === -1 || minimumIndex === -1) return false;
+  return currentIndex >= minimumIndex;
+}
+
 export function canViewEvaluation(evaluation = {}, viewer = {}) {
   if (!evaluation || !viewer) return false;
 
@@ -300,8 +321,10 @@ export function canViewEvaluation(evaluation = {}, viewer = {}) {
   if (viewer.id === employeeId) return true;
   if (viewer.id === supervisorId) return true;
 
-  const adminRoles = new Set(['admin', 'super_admin', 'hr_officer']);
-  if (adminRoles.has(viewer.role)) return true;
+  const oversightRoles = new Set(['admin', 'super_admin', 'hr_officer', 'executive']);
+  if (oversightRoles.has(String(viewer.role ?? '').toLowerCase())) {
+    return statusReached(evaluation.status, 'executive_review');
+  }
 
   return false;
 }
@@ -309,13 +332,13 @@ export function canViewEvaluation(evaluation = {}, viewer = {}) {
 export function canViewSelfAssessment(evaluation = {}, viewer = {}) {
   if (!evaluation || !viewer) return false;
 
-  if (['draft', 'goals_set'].includes(evaluation.status)) return false;
-
   if (viewer.id === (evaluation.employeeId ?? evaluation.employee_id)) return true;
   if (viewer.id === (evaluation.supervisorId ?? evaluation.supervisor_id)) return true;
 
-  const adminRoles = new Set(['admin', 'super_admin', 'hr_officer']);
-  if (adminRoles.has(viewer.role)) return true;
+  const oversightRoles = new Set(['admin', 'super_admin', 'hr_officer', 'executive']);
+  if (oversightRoles.has(String(viewer.role ?? '').toLowerCase())) {
+    return statusReached(evaluation.status, 'executive_review');
+  }
 
   return false;
 }
