@@ -9,8 +9,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "migrate": "node migrations/migrate.js",
-    "test": "node --test"
+    "migrate": "node migrations/migrate.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
