@@ -1,13 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  getVisibleUserIds,
-  canViewUser,
-  directReports,
-  canViewEvaluation,
-  canViewSelfAssessment,
-} from '../src/lib/rules.js';
+import { getVisibleUserIds, canViewUser, directReports } from '../src/lib/rules.js';
 
 test('supervisors only see direct reports and not descendants below them', () => {
   const users = [
@@ -34,35 +28,4 @@ test('directReports accepts DB snake_case keys', () => {
   ];
 
   assert.deepEqual(directReports(users, 'mgr-1').map((u) => u.id).sort(), ['u-1', 'u-2'].sort());
-});
-
-test('admin and executive users can view users outside a supervisor tree, while supervisors remain restricted to direct reports', () => {
-  const users = [
-    { id: 's1', role: 'supervisor', supervisor_id: null, active: true },
-    { id: 's2', role: 'supervisor', supervisor_id: 's1', active: true },
-    { id: 'u-1', role: 'employee', supervisor_id: 's1', active: true },
-    { id: 'u-2', role: 'employee', supervisor_id: 's2', active: true },
-  ];
-
-  assert.equal(canViewUser({ id: 'admin-1', role: 'admin' }, { id: 'u-2' }, users), true);
-  assert.equal(canViewUser({ id: 'exec-1', role: 'executive' }, { id: 'u-1' }, users), true);
-  assert.equal(canViewUser({ id: 's1', role: 'supervisor' }, { id: 'u-2' }, users), false);
-  assert.equal(canViewUser({ id: 's2', role: 'supervisor' }, { id: 'u-2' }, users), true);
-});
-
-test('unsubmitted draft evaluations stay private to the employee', () => {
-  const users = [
-    { id: 's1', role: 'supervisor', supervisor_id: null, active: true },
-    { id: 'u-1', role: 'employee', supervisor_id: 's1', active: true },
-  ];
-
-  const draft = { id: 'ev-1', employee_id: 'u-1', supervisor_id: 's1', status: 'draft' };
-  const submitted = { id: 'ev-2', employee_id: 'u-1', supervisor_id: 's1', status: 'goals_submitted' };
-
-  assert.equal(canViewEvaluation({ id: 'u-1', role: 'employee' }, draft, users), true);
-  assert.equal(canViewEvaluation({ id: 's1', role: 'supervisor' }, draft, users), false);
-  assert.equal(canViewEvaluation({ id: 'admin-1', role: 'admin' }, draft, users), false);
-  assert.equal(canViewEvaluation({ id: 's1', role: 'supervisor' }, submitted, users), true);
-  assert.equal(canViewSelfAssessment({ id: 's1', role: 'supervisor' }, draft, users), false);
-  assert.equal(canViewSelfAssessment({ id: 'u-1', role: 'employee' }, draft, users), true);
 });

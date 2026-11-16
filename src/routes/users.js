@@ -112,7 +112,7 @@ router.get('/team', requireAuth, async (req, res, next) => {
        FROM users ORDER BY name`
     );
 
-    if (['admin', 'executive', 'super_admin'].includes(req.user.role)) {
+    if (req.user.role === 'admin') {
       return res.json(allUsers);
     }
 

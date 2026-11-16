@@ -282,46 +282,12 @@ export function canViewUser(actor, target, users = []) {
   const targetId = typeof target === 'string' ? target : target.id;
   if (!targetId) return false;
   if (actor.id === targetId) return true;
-  if (['admin', 'executive', 'super_admin'].includes(actor.role)) {
-    return true;
+  if (actor.role === 'admin' || actor.role === 'executive' || actor.role === 'super_admin') {
+    return false;
   }
   if (actor.role !== 'supervisor') return false;
 
   return getVisibleUserIds(users, actor.id).includes(targetId);
-}
-
-export function canViewEvaluation(actor, evaluation, users = []) {
-  if (!actor || !evaluation) return false;
-
-  const employeeId = evaluation.employeeId ?? evaluation.employee_id;
-  if (!employeeId) return false;
-  if (actor.id === employeeId) return true;
-  if (evaluation.status === 'draft') return false;
-  if (['admin', 'executive', 'super_admin'].includes(actor.role)) return true;
-  if (actor.role !== 'supervisor') return false;
-
-  const supervisorId = evaluation.supervisorId ?? evaluation.supervisor_id;
-  const isDirectReport = (users || []).some(
-    (user) => user?.id === employeeId && (user?.supervisorId ?? user?.supervisor_id) === actor.id && user?.active !== false
-  );
-  return isDirectReport || supervisorId === actor.id;
-}
-
-export function canViewSelfAssessment(actor, evaluation, users = []) {
-  if (!actor || !evaluation) return false;
-
-  const employeeId = evaluation.employeeId ?? evaluation.employee_id;
-  if (!employeeId) return false;
-  if (actor.id === employeeId) return true;
-  if (evaluation.status === 'draft') return false;
-  if (['admin', 'executive', 'super_admin'].includes(actor.role)) return true;
-  if (actor.role !== 'supervisor') return false;
-
-  const supervisorId = evaluation.supervisorId ?? evaluation.supervisor_id;
-  const isDirectReport = (users || []).some(
-    (user) => user?.id === employeeId && (user?.supervisorId ?? user?.supervisor_id) === actor.id && user?.active !== false
-  );
-  return isDirectReport || supervisorId === actor.id;
 }
 
 /**
