@@ -21,6 +21,8 @@ import { query, getClient } from '../db.js';
 import {
   canReassign,
   canSign,
+  canViewEvaluation,
+  canViewSelfAssessment,
   canViewUser,
   departureWaivers,
   getVisibleUserIds,
@@ -580,12 +582,13 @@ router.get('/mine', requireAuth, async (req, res, next) => {
 router.get('/', requireAuth, async (req, res, next) => {
   try {
     let rows;
-    if (req.user.role === 'admin') {
+    if (['admin', 'executive', 'super_admin'].includes(req.user.role)) {
       ({ rows } = await query(
         `SELECT e.*, eu.name AS employee_name, su.name AS supervisor_name
          FROM evaluations e
          LEFT JOIN users eu ON eu.id = e.employee_id
          LEFT JOIN users su ON su.id = e.supervisor_id
+         WHERE e.status != 'draft'
          ORDER BY e.updated_at DESC`
       ));
     } else {
@@ -609,10 +612,11 @@ router.get('/', requireAuth, async (req, res, next) => {
          FROM evaluations e
          LEFT JOIN users eu ON eu.id = e.employee_id
          LEFT JOIN users su ON su.id = e.supervisor_id
-         WHERE e.employee_id = ANY($1)
-            OR e.supervisor_id = ANY($1)
+         WHERE (e.employee_id = ANY($1)
+            OR e.supervisor_id = ANY($1))
+           AND (e.status != 'draft' OR e.employee_id = $2)
          ORDER BY e.updated_at DESC`,
-        [visibleIds]
+        [visibleIds, req.user.id]
       ));
     }
     res.json(rows);
@@ -757,7 +761,8 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
-    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
+    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
+    const canRead = canViewEvaluation(req.user, ev, allUsers);
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this evaluation.' });
     }
@@ -774,7 +779,8 @@ router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
 
-    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
+    const { rows: allUsers } = await query('SELECT id, supervisor_id, active FROM users');
+    const canRead = canViewSelfAssessment(req.user, ev, allUsers);
     if (!canRead) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this self-assessment.' });
     }
