@@ -276,15 +276,72 @@ export function getVisibleUserIds(users = [], userId = '') {
     .map((user) => user.id);
 }
 
+export function canView(user, evaluation) {
+  if (!user || !evaluation) return false;
+
+  const employeeId = evaluation.employeeId ?? evaluation.employee_id ?? null;
+  const status = String(evaluation.status ?? '').trim().toLowerCase();
+  if (!employeeId) return false;
+  if (user.id === employeeId) return true;
+
+  if (['admin', 'super_admin'].includes(user.role)) {
+    return evaluation.status !== 'draft';
+  }
+
+  if (user.role === 'executive') {
+    return ['executive_review', 'signoff', 'hr_review', 'locked', 'completed'].includes(status);
+  }
+
+  if (evaluation.status === 'draft') return false;
+
+  const supervisorId = evaluation.supervisorId ?? evaluation.supervisor_id ?? null;
+  if (user.role === 'supervisor' && supervisorId === user.id) return true;
+
+  return false;
+}
+
+export function canAct(user, evaluation, action) {
+  if (!user || !evaluation) return false;
+
+  const employeeId = evaluation.employeeId ?? evaluation.employee_id ?? null;
+  const supervisorId = evaluation.supervisorId ?? evaluation.supervisor_id ?? null;
+  const status = String(evaluation.status ?? '').trim().toLowerCase();
+
+  if (!employeeId || employeeId === user.id) return false;
+
+  if (['admin', 'super_admin'].includes(user.role)) {
+    if (status === 'locked') return false;
+    if (action === 'edit_attendance') return true;
+    if (action === 'edit_incidents') return true;
+  }
+
+  if (user.role === 'compliance' && action === 'edit_attendance') {
+    return status !== 'locked';
+  }
+
+  if (supervisorId !== user.id) return false;
+
+  switch (action) {
+    case 'approve_goals':
+      return status === 'goals_submitted';
+    case 'score':
+      return status === 'supervisor_assessment';
+    case 'record_agreed':
+      return status === 'review_meeting';
+    case 'sign':
+      return status === 'signoff' && !(evaluation.signatures?.supervisor?.signedAt || evaluation.signatures?.supervisor?.type === 'waived');
+    default:
+      return false;
+  }
+}
+
 export function canViewUser(actor, target, users = []) {
   if (!actor || !target) return false;
 
   const targetId = typeof target === 'string' ? target : target.id;
   if (!targetId) return false;
   if (actor.id === targetId) return true;
-  if (actor.role === 'admin' || actor.role === 'executive' || actor.role === 'super_admin') {
-    return false;
-  }
+  if (['admin', 'executive', 'super_admin'].includes(actor.role)) return true;
   if (actor.role !== 'supervisor') return false;
 
   return getVisibleUserIds(users, actor.id).includes(targetId);

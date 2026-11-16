@@ -21,6 +21,7 @@ import { query, getClient } from '../db.js';
 import {
   canReassign,
   canSign,
+  canView,
   canViewUser,
   departureWaivers,
   getVisibleUserIds,
@@ -757,8 +758,12 @@ router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
-    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
-    if (!canRead) {
+    const allowed = canView(req.user, {
+      employeeId: ev.employee_id,
+      supervisorId: ev.supervisor_id,
+      status: ev.status,
+    });
+    if (!allowed) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this evaluation.' });
     }
     const sigs = await loadSignatures(ev.id, null);
@@ -774,8 +779,12 @@ router.get('/:id/self-assessment', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, req.params.id, null);
     if (!ev) return;
 
-    const canRead = ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
-    if (!canRead) {
+    const allowed = canView(req.user, {
+      employeeId: ev.employee_id,
+      supervisorId: ev.supervisor_id,
+      status: ev.status,
+    });
+    if (!allowed) {
       return res.status(403).json({ error: 'Forbidden: you do not have permission to view this self-assessment.' });
     }
 
@@ -1268,6 +1277,13 @@ router.patch('/:id/attendance', requireAuth, async (req, res, next) => {
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
 
+    if (!['admin', 'super_admin', 'compliance'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden: only admin or compliance staff may edit the attendance log.' });
+    }
+    if (ev.status === 'locked') {
+      return res.status(422).json({ error: 'This evaluation is locked and cannot be edited.' });
+    }
+
     const { rows: [updated] } = await query(
       `UPDATE evaluations SET attendance = $1, updated_at = now() WHERE id = $2 RETURNING *`,
       [JSON.stringify(attendance || []), id]
@@ -1285,6 +1301,13 @@ router.patch('/:id/incidents', requireAuth, async (req, res, next) => {
     const { incidents } = req.body ?? {};
     const ev = await getEvalOrFail(res, id, null);
     if (!ev) return;
+
+    if (!['admin', 'super_admin'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden: only admin staff may edit the incident log.' });
+    }
+    if (ev.status === 'locked') {
+      return res.status(422).json({ error: 'This evaluation is locked and cannot be edited.' });
+    }
 
     const { rows: [updated] } = await query(
       `UPDATE evaluations SET incidents = $1, updated_at = now() WHERE id = $2 RETURNING *`,
