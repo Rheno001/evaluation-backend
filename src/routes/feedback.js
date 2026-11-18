@@ -77,10 +77,9 @@ const reasonSchema = z
 // Router 1: Evaluations Feedback Router (Mounted at /evaluations)
 // ─────────────────────────────────────────────────────────────────────────────
 export const evaluationsFeedbackRouter = Router();
-evaluationsFeedbackRouter.use(requireColleagueFeedbackFeature);
 
 // POST /evaluations/:id/feedback — Give feedback (with row locking for caps)
-evaluationsFeedbackRouter.post('/:id/feedback', requireAuth, async (req, res, next) => {
+evaluationsFeedbackRouter.post('/:id/feedback', requireColleagueFeedbackFeature, requireAuth, async (req, res, next) => {
   try {
     const parseRes = createFeedbackSchema.safeParse(req.body);
     if (!parseRes.success) {
@@ -157,7 +156,7 @@ evaluationsFeedbackRouter.post('/:id/feedback', requireAuth, async (req, res, ne
 });
 
 // GET /evaluations/:id/feedback — Named feedback for supervisor & admin
-evaluationsFeedbackRouter.get('/:id/feedback', requireAuth, async (req, res, next) => {
+evaluationsFeedbackRouter.get('/:id/feedback', requireColleagueFeedbackFeature, requireAuth, async (req, res, next) => {
   try {
     const evalRes = await query('SELECT * FROM evaluations WHERE id = $1', [req.params.id]);
     if (evalRes.rows.length === 0) {
@@ -193,7 +192,7 @@ evaluationsFeedbackRouter.get('/:id/feedback', requireAuth, async (req, res, nex
 });
 
 // GET /evaluations/:id/feedback/summary — Evaluated person summary (only after agreed scores confirmed)
-evaluationsFeedbackRouter.get('/:id/feedback/summary', requireAuth, async (req, res, next) => {
+evaluationsFeedbackRouter.get('/:id/feedback/summary', requireColleagueFeedbackFeature, requireAuth, async (req, res, next) => {
   try {
     const evalRes = await query('SELECT * FROM evaluations WHERE id = $1', [req.params.id]);
     if (evalRes.rows.length === 0) {
@@ -235,10 +234,9 @@ evaluationsFeedbackRouter.get('/:id/feedback/summary', requireAuth, async (req, 
 // Router 2: Author's Own Feedback (Mounted at /me)
 // ─────────────────────────────────────────────────────────────────────────────
 export const meFeedbackRouter = Router();
-meFeedbackRouter.use(requireColleagueFeedbackFeature);
 
 // GET /me/feedback-given
-meFeedbackRouter.get('/feedback-given', requireAuth, async (req, res, next) => {
+meFeedbackRouter.get('/feedback-given', requireColleagueFeedbackFeature, requireAuth, async (req, res, next) => {
   try {
     const { rows } = await query(
       `SELECT f.*, u.name as colleague_name, u.department as colleague_department,

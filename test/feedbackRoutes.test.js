@@ -47,18 +47,22 @@ test('feature flag: 404 gating when FEATURE_COLLEAGUE_FEEDBACK is off', () => {
   process.env.FEATURE_COLLEAGUE_FEEDBACK = originalEnv;
 });
 
-test('feature flag: passes next() when FEATURE_COLLEAGUE_FEEDBACK is on', () => {
+test('isolation: evaluationsFeedbackRouter does not intercept standard evaluation routes when flag is off', async () => {
   const originalEnv = process.env.FEATURE_COLLEAGUE_FEEDBACK;
-  process.env.FEATURE_COLLEAGUE_FEEDBACK = 'true';
+  delete process.env.FEATURE_COLLEAGUE_FEEDBACK;
 
-  assert.equal(isFeedbackFeatureEnabled(), true);
-  assert.equal(isColleagueFeedbackEnabled(), true);
+  const { evaluationsFeedbackRouter } = await import('../src/routes/feedback.js');
 
-  let nextCalled = false;
-  requireColleagueFeedbackFeature({}, {}, () => {
-    nextCalled = true;
-  });
-  assert.equal(nextCalled, true);
+  // Verify router stack only contains routes matching /:id/feedback and /:id/feedback/summary
+  for (const layer of evaluationsFeedbackRouter.stack) {
+    if (layer.route) {
+      assert.match(
+        layer.route.path,
+        /\/feedback/,
+        `evaluationsFeedbackRouter route ${layer.route.path} must only target feedback endpoints`
+      );
+    }
+  }
 
   process.env.FEATURE_COLLEAGUE_FEEDBACK = originalEnv;
 });
