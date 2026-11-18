@@ -300,6 +300,9 @@ export function canView(user, evaluation) {
   return false;
 }
 
+import { feedbackWindowOpen } from './feedbackRules.js';
+export * from './feedbackRules.js';
+
 export function canAct(user, evaluation, action) {
   if (!user || !evaluation) return false;
 
@@ -307,6 +310,37 @@ export function canAct(user, evaluation, action) {
   const supervisorId = evaluation.supervisorId ?? evaluation.supervisor_id ?? null;
   const status = String(evaluation.status ?? '').trim().toLowerCase();
 
+  // ── Colleague feedback permission actions ──────────────────────────────────
+  if (action === 'view_feedback_anonymous') {
+    const scoresConfirmed = ['executive_review', 'signoff', 'hr_review', 'locked', 'completed'].includes(status);
+    if (!scoresConfirmed) return false;
+    return user.id === employeeId || user.role === 'executive';
+  }
+
+  if (action === 'give_feedback') {
+    if (!employeeId || employeeId === user.id) return false;
+    if (supervisorId === user.id) return false;
+    if (user.active === false) return false;
+    return feedbackWindowOpen(evaluation);
+  }
+
+  if (action === 'view_feedback_named') {
+    if (['admin', 'super_admin'].includes(user.role)) return true;
+    return supervisorId === user.id;
+  }
+
+  if (action === 'mark_feedback_not_relevant') {
+    if (['admin', 'super_admin'].includes(user.role)) return status !== 'locked';
+    if (supervisorId !== user.id) return false;
+    return feedbackWindowOpen(evaluation);
+  }
+
+  if (action === 'hide_feedback') {
+    if (['admin', 'super_admin'].includes(user.role)) return status !== 'locked';
+    return false;
+  }
+
+  // ── Existing permission logic ──────────────────────────────────────────────
   if (!employeeId || employeeId === user.id) return false;
 
   if (['admin', 'super_admin'].includes(user.role)) {

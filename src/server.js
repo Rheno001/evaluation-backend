@@ -10,6 +10,14 @@ import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import cycleRoutes from './routes/cycles.js';
 import evaluationRoutes from './routes/evaluations.js';
+import configRoutes from './routes/config.js';
+import colleaguesRoutes from './routes/colleagues.js';
+import {
+  evaluationsFeedbackRouter,
+  meFeedbackRouter,
+  feedbackItemRouter,
+  requireColleagueFeedbackFeature,
+} from './routes/feedback.js';
 
 const app = express();
 
@@ -29,7 +37,12 @@ app.use((req, res, next) => {
 app.use('/auth',        authRoutes);
 app.use('/users',       userRoutes);
 app.use('/cycles',      cycleRoutes);
+app.use('/config',      configRoutes);
+app.use('/colleagues',  requireColleagueFeedbackFeature, colleaguesRoutes);
+app.use('/evaluations', evaluationsFeedbackRouter);
 app.use('/evaluations', evaluationRoutes);
+app.use('/me',          meFeedbackRouter);
+app.use('/feedback',    feedbackItemRouter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
