@@ -6,6 +6,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'http';
+import zlib from 'zlib';
+
+function extractPdfText(buf) {
+  let idx = 0;
+  let allText = '';
+  while (true) {
+    const s = buf.indexOf('stream', idx);
+    if (s === -1) break;
+    let ds = s + 6;
+    while (buf[ds] === 10 || buf[ds] === 13) ds++;
+    const e = buf.indexOf('endstream', ds);
+    if (e === -1) break;
+    let de = e;
+    while (buf[de - 1] === 10 || buf[de - 1] === 13) de--;
+    try {
+      const dec = zlib.inflateSync(buf.subarray(ds, de)).toString('utf8');
+      const hexMatches = dec.match(/<([0-9a-fA-F]+)>/g) || [];
+      for (const h of hexMatches) {
+        allText += Buffer.from(h.slice(1, -1), 'hex').toString('utf8');
+      }
+    } catch {}
+    idx = e + 9;
+  }
+  return allText;
+}
 
 // ── Mock data layer before importing the app ─────────────────────────────────
 import { pool } from '../src/db.js';
@@ -287,6 +312,20 @@ test('Colleague Feedback: live PDF generation includes colleague feedback', asyn
       context: 'Worked on Q1 release together',
       comment: 'Exceptional cross-team collaboration.',
       status: 'submitted',
+      created_at: new Date().toISOString(),
+    },
+    {
+      id: 'fb-2',
+      evaluation_id: 'ev-400',
+      author_id: 'col-2',
+      author_name: 'Bob Colleague',
+      project: 'API Gateway',
+      behaviour: 'quality',
+      rating: 4,
+      context: 'Reviewed code quality and tests',
+      comment: 'High standards of code craftsmanship.',
+      status: 'submitted',
+      created_at: new Date().toISOString(),
     },
   ];
 
@@ -297,4 +336,84 @@ test('Colleague Feedback: live PDF generation includes colleague feedback', asyn
   assert.equal(res.status, 200);
   assert.equal(res.headers['content-type'], 'application/pdf');
   assert.ok(res.body.length > 500, 'Live generated PDF with feedback must have substantial content');
+  const text = extractPdfText(res.body);
+  assert.ok(text.includes('Jane Colleague'), 'Supervisor/Admin PDF includes Jane Colleague');
+  assert.ok(text.includes('Bob Colleague'), 'Supervisor/Admin PDF includes Bob Colleague');
+  assert.ok(text.includes('Core Platform'), 'PDF includes project name');
+  assert.ok(text.includes('API Gateway'), 'PDF includes second project name');
+  assert.ok(text.includes('Teamwork & Collaboration'), 'PDF includes behaviour category');
+});
+
+test('Colleague Feedback: employee receives anonymous "A colleague" and no author names in PDF', async () => {
+  const emp = { id: 'emp-1', name: 'Emp One', role: 'employee', active: true };
+  const tokenEmp = userToken(emp);
+
+  currentEval = {
+    id: 'ev-401',
+    employee_id: 'emp-1',
+    supervisor_id: 'sup-1',
+    period: '2026-Q1',
+    status: 'locked',
+  };
+  currentArch = false;
+  currentSignatures = [
+    { slot: 'employee', signer_name: 'Emp One', signed_at: new Date().toISOString() },
+    { slot: 'supervisor', signer_name: 'Sup One', signed_at: new Date().toISOString() },
+    { slot: 'hr_officer', signer_name: 'HR One', signed_at: new Date().toISOString() },
+  ];
+  currentFeedback = [
+    {
+      id: 'fb-1',
+      evaluation_id: 'ev-401',
+      author_id: 'secret-author-999',
+      author_name: 'Secret Colleague Name',
+      project: 'Top Secret Project',
+      behaviour: 'communication',
+      rating: 5,
+      context: 'Observed communication in team standups',
+      comment: 'Very clear communication style.',
+      status: 'submitted',
+      created_at: new Date().toISOString(),
+    },
+  ];
+
+  const res = await request('GET', '/evaluations/ev-401/pdf', {
+    authorization: `Bearer ${tokenEmp}`,
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers['content-type'], 'application/pdf');
+  const text = extractPdfText(res.body);
+  assert.ok(!text.includes('Secret Colleague Name'), 'Employee PDF must never expose author real name');
+  assert.ok(!text.includes('secret-author-999'), 'Employee PDF must never expose author ID');
+  assert.ok(text.includes('A colleague'), 'Employee PDF must display "A colleague"');
+});
+
+test('Colleague Feedback: empty feedback state renders gracefully', async () => {
+  const admin = { id: 'adm-1', name: 'Admin User', role: 'admin', active: true };
+  const tokenAdmin = userToken(admin);
+
+  currentEval = {
+    id: 'ev-402',
+    employee_id: 'emp-1',
+    supervisor_id: 'sup-1',
+    period: '2026-Q1',
+    status: 'locked',
+  };
+  currentArch = false;
+  currentSignatures = [
+    { slot: 'employee', signer_name: 'Emp One', signed_at: new Date().toISOString() },
+    { slot: 'supervisor', signer_name: 'Sup One', signed_at: new Date().toISOString() },
+    { slot: 'hr_officer', signer_name: 'HR One', signed_at: new Date().toISOString() },
+  ];
+  currentFeedback = [];
+
+  const res = await request('GET', '/evaluations/ev-402/pdf', {
+    authorization: `Bearer ${tokenAdmin}`,
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers['content-type'], 'application/pdf');
+  const text = extractPdfText(res.body);
+  assert.ok(text.includes('No colleague feedback was submitted'), 'Must render empty state message in PDF');
 });

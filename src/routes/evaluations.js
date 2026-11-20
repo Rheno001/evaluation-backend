@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { requireAuth, requireRole } from '../auth.js';
 import { query, getClient } from '../db.js';
 import {
+  canAct,
   canReassign,
   canSign,
   canView,
@@ -192,7 +193,7 @@ async function loadEvalForPdf(id) {
 
   // --- NEW: fetch colleague feedback entries for this evaluation
   const { rows: feedback } = await query(
-    `SELECT f.id, f.project, f.behaviour, f.rating, f.context, f.comment, f.status,
+    `SELECT f.id, f.project, f.behaviour, f.rating, f.context, f.comment, f.status, f.created_at,
             u.name AS author_name, u.department AS author_department
      FROM feedback f
      JOIN users u ON u.id = f.author_id
@@ -496,8 +497,12 @@ function drawEvaluationPdf(doc, { ev, sigs, nameOf, feedbackEntries = [] }) {
     doc.moveDown(0.8);
   }
 
-  if (feedbackEntries && feedbackEntries.length > 0) {
-    sectionTitle(doc, 'Colleague Feedback');
+  sectionTitle(doc, 'Colleague Feedback');
+  if (!feedbackEntries || feedbackEntries.length === 0) {
+    doc.font('Helvetica-Oblique').fontSize(9.5).fillColor(C.muted)
+      .text('No colleague feedback was submitted for this evaluation period.', X0, doc.y, { width: CW });
+    doc.moveDown(0.8);
+  } else {
     const BEHAVIOUR_LABELS = {
       communication: 'Communication',
       ownership: 'Ownership & Accountability',
@@ -518,13 +523,16 @@ function drawEvaluationPdf(doc, { ev, sigs, nameOf, feedbackEntries = [] }) {
       for (const item of items) {
         const ratingStr = item.rating !== null && item.rating !== undefined ? `${item.rating} / 5` : '–';
         const authorStr = item.author_name || item.authorName || 'A colleague';
-        const projectStr = item.project ? `Project: ${item.project}` : '';
-        const contextStr = item.context ? `Context: ${item.context}` : '';
-        const commentStr = item.comment || '';
-        const subLines = [projectStr, contextStr, commentStr].filter(Boolean).join('\n');
+        const dateStr = item.created_at ? fmtDate(item.created_at) : null;
+        const titleLine = dateStr ? `${authorStr}  ·  Submitted: ${dateStr}` : authorStr;
+        const details = [
+          item.project ? `Project: ${item.project}` : null,
+          item.context ? `What was observed: ${item.context}` : null,
+          item.comment ? `Comment: ${item.comment}` : null,
+        ].filter(Boolean).join('\n');
         rows.push({
           cells: [
-            { title: authorStr, sub: subLines },
+            { title: titleLine, sub: details },
             ratingStr,
           ],
         });
@@ -1649,22 +1657,23 @@ router.get('/:id/pdf', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden.' });
     }
 
+    const canSeeNamed = canAct(req.user, ev, 'view_feedback_named') || ['admin', 'super_admin', 'hr', 'hr_officer'].includes(req.user.role);
+
+    // Shape feedback entries based on viewer permissions (strict anonymity for employee)
+    data.feedbackEntries = (data.feedbackEntries || []).map((fb) => ({
+      ...fb,
+      author_name: canSeeNamed ? (fb.author_name || 'A colleague') : 'A colleague',
+      authorName: canSeeNamed ? (fb.author_name || 'A colleague') : 'A colleague',
+    }));
+
     let pdf;
     const { rows: arch } = await query('SELECT pdf FROM evaluation_archives WHERE evaluation_id = $1', [id]);
-    if (arch[0]) {
+    if (ALL_SLOTS.every((s) => sigs[s])) {
+      pdf = await buildPdfBuffer(data);
+    } else if (arch[0]) {
       pdf = arch[0].pdf;
     } else {
-      if (!ALL_SLOTS.every((s) => sigs[s])) {
-        return res.status(422).json({ error: 'The PDF is available once HR has signed.' });
-      }
-      pdf = await buildPdfBuffer(data);
-      if (ev.status === 'locked') {
-        await query(
-          `INSERT INTO evaluation_archives (evaluation_id, pdf, created_by)
-           VALUES ($1,$2,$3) ON CONFLICT (evaluation_id) DO NOTHING`,
-          [id, pdf, req.user.id]
-        );
-      }
+      return res.status(422).json({ error: 'The PDF is available once HR has signed.' });
     }
     res.setHeader('Cache-Control', 'no-store');
     res.removeHeader('ETag');
