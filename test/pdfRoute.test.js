@@ -14,6 +14,7 @@ let currentUsersById = {};
 let currentEval = null;
 let currentArch = null;
 let currentSignatures = [];
+let currentFeedback = [];
 
 pool.query = async (sql, params) => {
   const queryStr = typeof sql === 'string' ? sql : sql.text;
@@ -33,6 +34,10 @@ pool.query = async (sql, params) => {
 
   if (/FROM signatures/i.test(queryStr)) {
     return { rows: currentSignatures, rowCount: currentSignatures.length };
+  }
+
+  if (/FROM feedback/i.test(queryStr)) {
+    return { rows: currentFeedback, rowCount: currentFeedback.length };
   }
 
   if (/FROM evaluations/i.test(queryStr)) {
@@ -251,4 +256,45 @@ test('Error handling: returns clear JSON error with right status and no internal
   const json = JSON.parse(res.body.toString());
   assert.equal(json.error, 'Evaluation nonexistent not found.');
   assert.equal(json.stack, undefined);
+});
+
+test('Colleague Feedback: live PDF generation includes colleague feedback', async () => {
+  const admin = { id: 'adm-1', name: 'Admin User', role: 'admin', active: true };
+  const tokenAdmin = userToken(admin);
+
+  currentEval = {
+    id: 'ev-400',
+    employee_id: 'emp-1',
+    supervisor_id: 'sup-1',
+    period: '2026-Q1',
+    status: 'locked',
+  };
+  currentArch = false;
+  currentSignatures = [
+    { slot: 'employee', signer_name: 'Emp One', signed_at: new Date().toISOString() },
+    { slot: 'supervisor', signer_name: 'Sup One', signed_at: new Date().toISOString() },
+    { slot: 'hr_officer', signer_name: 'HR One', signed_at: new Date().toISOString() },
+  ];
+  currentFeedback = [
+    {
+      id: 'fb-1',
+      evaluation_id: 'ev-400',
+      author_id: 'col-1',
+      author_name: 'Jane Colleague',
+      project: 'Core Platform',
+      behaviour: 'teamwork',
+      rating: 5,
+      context: 'Worked on Q1 release together',
+      comment: 'Exceptional cross-team collaboration.',
+      status: 'submitted',
+    },
+  ];
+
+  const res = await request('GET', '/evaluations/ev-400/pdf', {
+    authorization: `Bearer ${tokenAdmin}`,
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers['content-type'], 'application/pdf');
+  assert.ok(res.body.length > 500, 'Live generated PDF with feedback must have substantial content');
 });

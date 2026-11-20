@@ -204,42 +204,6 @@ async function loadSignatures(evaluationId, client = null) {
     return { ev, sigs, nameOf, feedbackEntries: feedback };
   }
 
-  const { rows } = await query(
-    'SELECT * FROM evaluations WHERE id = $1',
-    [id]
-  );
-
-  const ev = rows[0];
-
-  if (!ev) {
-    return null;
-  }
-
-  const sigs = await loadSignatures(id, null);
-
-  const userIds = [
-    ev.employee_id,
-    ev.supervisor_id,
-  ].filter(Boolean);
-
-  const { rows: users } = await query(
-    'SELECT id, name FROM users WHERE id = ANY($1)',
-    [userIds]
-  );
-
-  const nameOf = (userId) => {
-    if (!userId) return 'N/A';
-
-    const user = users.find(
-      (item) => String(item.id) === String(userId)
-    );
-
-    return user?.name ?? 'N/A';
-  };
-
-  return { ev, sigs, nameOf };
-}
-
 // ── PDF design ───────────────────────────────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOGO = (() => {
@@ -450,7 +414,7 @@ function signatureBoxes(doc, sigs) {
     .text("Each signature was confirmed with the signer's password at the time of signing.", X0, doc.y, { width: CW });
 }
 
-function drawEvaluationPdf(doc, { ev, sigs, nameOf }) {
+function drawEvaluationPdf(doc, { ev, sigs, nameOf, feedbackEntries = [] }) {
   const staff = computeScores(ev, 'staff');
   const sup = computeScores(ev, 'supervisor');
   const agreed = computeScores(ev, 'agreed');
@@ -530,6 +494,46 @@ function drawEvaluationPdf(doc, { ev, sigs, nameOf }) {
     doc.font('Helvetica-Oblique').fontSize(8.5).fillColor(C.muted)
       .text(`— ${ev.part_i.authorName}, ${fmtDate(ev.part_i.submittedAt)}`, X0, doc.y - 4);
     doc.moveDown(0.8);
+  }
+
+  if (feedbackEntries && feedbackEntries.length > 0) {
+    sectionTitle(doc, 'Colleague Feedback');
+    const BEHAVIOUR_LABELS = {
+      communication: 'Communication',
+      ownership: 'Ownership & Accountability',
+      quality: 'Quality of Work',
+      teamwork: 'Teamwork & Collaboration',
+      clientFocus: 'Client / Customer Focus',
+    };
+    const grouped = {};
+    for (const fb of feedbackEntries) {
+      const b = fb.behaviour || 'other';
+      if (!grouped[b]) grouped[b] = [];
+      grouped[b].push(fb);
+    }
+    const rows = [];
+    for (const [behaviour, items] of Object.entries(grouped)) {
+      const label = BEHAVIOUR_LABELS[behaviour] || behaviour;
+      rows.push({ group: label });
+      for (const item of items) {
+        const ratingStr = item.rating !== null && item.rating !== undefined ? `${item.rating} / 5` : '–';
+        const authorStr = item.author_name || item.authorName || 'A colleague';
+        const projectStr = item.project ? `Project: ${item.project}` : '';
+        const contextStr = item.context ? `Context: ${item.context}` : '';
+        const commentStr = item.comment || '';
+        const subLines = [projectStr, contextStr, commentStr].filter(Boolean).join('\n');
+        rows.push({
+          cells: [
+            { title: authorStr, sub: subLines },
+            ratingStr,
+          ],
+        });
+      }
+    }
+    table(doc,
+      [{ label: 'FEEDBACK & DETAILS', width: 415 }, { label: 'RATING', width: 80, align: 'center' }],
+      rows
+    );
   }
 
   sectionTitle(doc, 'Part J — Digital Sign-off & Confirmation');
