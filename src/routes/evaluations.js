@@ -155,7 +155,55 @@ async function loadSignatures(evaluationId, client = null) {
   return signatures;
 }
 
-async function loadEvalForPdf(id) {
+  // Load evaluation and related data for PDF generation, including colleague feedback
+  async function loadEvalForPdf(id) {
+    const { rows } = await query(
+      'SELECT * FROM evaluations WHERE id = $1',
+      [id]
+    );
+
+    const ev = rows[0];
+
+    if (!ev) {
+      return null;
+    }
+
+    const sigs = await loadSignatures(id, null);
+
+    const userIds = [
+      ev.employee_id,
+      ev.supervisor_id,
+    ].filter(Boolean);
+
+    const { rows: users } = await query(
+      'SELECT id, name FROM users WHERE id = ANY($1)',
+      [userIds]
+    );
+
+    const nameOf = (userId) => {
+      if (!userId) return 'N/A';
+
+      const user = users.find(
+        (item) => String(item.id) === String(userId)
+      );
+
+      return user?.name ?? 'N/A';
+    };
+
+    // --- NEW: fetch colleague feedback entries for this evaluation
+    const { rows: feedback } = await query(
+      `SELECT f.id, f.project, f.behaviour, f.rating, f.context, f.comment, f.status,
+              u.name AS author_name, u.department AS author_department
+       FROM feedback f
+       JOIN users u ON u.id = f.author_id
+       WHERE f.evaluation_id = $1 AND f.status = 'submitted'
+       ORDER BY f.created_at ASC`,
+      [id]
+    );
+
+    return { ev, sigs, nameOf, feedbackEntries: feedback };
+  }
+
   const { rows } = await query(
     'SELECT * FROM evaluations WHERE id = $1',
     [id]
@@ -1586,17 +1634,16 @@ router.post('/:id/waive-employee-sig', requireAuth, requireRole('admin'), async 
 });
 
 // GET /evaluations/:id/pdf — serves the archived copy once finalized, a live one before that
-router.get('/:id/pdf', requireAuth, async (req, res, next) => {
+router.get('/:id/pdf', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const data = await loadEvalForPdf(id);
     if (!data) return res.status(404).json({ error: `Evaluation ${id} not found.` });
     const { ev, sigs } = data;
 
-    const allowed =
-      ['admin', 'hr_officer', 'executive'].includes(req.user.role) ||
-      ev.employee_id === req.user.id || ev.supervisor_id === req.user.id;
-    if (!allowed) return res.status(403).json({ error: 'Forbidden.' });
+    if (!canView(req.user, ev)) {
+      return res.status(403).json({ error: 'Forbidden.' });
+    }
 
     let pdf;
     const { rows: arch } = await query('SELECT pdf FROM evaluation_archives WHERE evaluation_id = $1', [id]);
@@ -1615,12 +1662,15 @@ router.get('/:id/pdf', requireAuth, async (req, res, next) => {
         );
       }
     }
+    res.setHeader('Cache-Control', 'no-store');
+    res.removeHeader('ETag');
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="evaluation-${id.replace(/[^\w.-]/g, '_')}.pdf"`);
-    res.send(pdf);
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+    res.end(pdf);
   } catch (err) {
     console.error('PDF route failed:', err);
-    next(err);
+    return res.status(500).json({ error: 'Failed to generate evaluation PDF.' });
   }
 });
 
