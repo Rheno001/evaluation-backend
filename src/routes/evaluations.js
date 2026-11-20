@@ -155,54 +155,54 @@ async function loadSignatures(evaluationId, client = null) {
   return signatures;
 }
 
-  // Load evaluation and related data for PDF generation, including colleague feedback
-  async function loadEvalForPdf(id) {
-    const { rows } = await query(
-      'SELECT * FROM evaluations WHERE id = $1',
-      [id]
-    );
+// Load evaluation and related data for PDF generation, including colleague feedback
+async function loadEvalForPdf(id) {
+  const { rows } = await query(
+    'SELECT * FROM evaluations WHERE id = $1',
+    [id]
+  );
 
-    const ev = rows[0];
+  const ev = rows[0];
 
-    if (!ev) {
-      return null;
-    }
-
-    const sigs = await loadSignatures(id, null);
-
-    const userIds = [
-      ev.employee_id,
-      ev.supervisor_id,
-    ].filter(Boolean);
-
-    const { rows: users } = await query(
-      'SELECT id, name FROM users WHERE id = ANY($1)',
-      [userIds]
-    );
-
-    const nameOf = (userId) => {
-      if (!userId) return 'N/A';
-
-      const user = users.find(
-        (item) => String(item.id) === String(userId)
-      );
-
-      return user?.name ?? 'N/A';
-    };
-
-    // --- NEW: fetch colleague feedback entries for this evaluation
-    const { rows: feedback } = await query(
-      `SELECT f.id, f.project, f.behaviour, f.rating, f.context, f.comment, f.status,
-              u.name AS author_name, u.department AS author_department
-       FROM feedback f
-       JOIN users u ON u.id = f.author_id
-       WHERE f.evaluation_id = $1 AND f.status = 'submitted'
-       ORDER BY f.created_at ASC`,
-      [id]
-    );
-
-    return { ev, sigs, nameOf, feedbackEntries: feedback };
+  if (!ev) {
+    return null;
   }
+
+  const sigs = await loadSignatures(id, null);
+
+  const userIds = [
+    ev.employee_id,
+    ev.supervisor_id,
+  ].filter(Boolean);
+
+  const { rows: users } = await query(
+    'SELECT id, name FROM users WHERE id = ANY($1)',
+    [userIds]
+  );
+
+  const nameOf = (userId) => {
+    if (!userId) return 'N/A';
+
+    const user = users.find(
+      (item) => String(item.id) === String(userId)
+    );
+
+    return user?.name ?? 'N/A';
+  };
+
+  // --- NEW: fetch colleague feedback entries for this evaluation
+  const { rows: feedback } = await query(
+    `SELECT f.id, f.project, f.behaviour, f.rating, f.context, f.comment, f.status,
+            u.name AS author_name, u.department AS author_department
+     FROM feedback f
+     JOIN users u ON u.id = f.author_id
+     WHERE f.evaluation_id = $1 AND f.status = 'submitted'
+     ORDER BY f.created_at ASC`,
+    [id]
+  );
+
+  return { ev, sigs, nameOf, feedbackEntries: feedback };
+}
 
 // ── PDF design ───────────────────────────────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
